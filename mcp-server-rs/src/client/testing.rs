@@ -31,16 +31,18 @@ impl super::ISClient {
         .await
     }
 
+    /// Returns plain text, not JSON -- must use `invoke_post_raw`.
     pub async fn test_text_report(&self, execution_id: &str) -> Result<Value, String> {
-        self.invoke_post(
+        self.invoke_post_raw(
             "wm.task.executor:textreport",
             &json!({"executionID": execution_id}),
         )
         .await
     }
 
+    /// Returns XML, not JSON -- must use `invoke_post_raw`.
     pub async fn test_junit_report(&self, execution_id: &str) -> Result<Value, String> {
-        self.invoke_post(
+        self.invoke_post_raw(
             "wm.task.executor:junitxmlreport",
             &json!({"executionID": execution_id}),
         )

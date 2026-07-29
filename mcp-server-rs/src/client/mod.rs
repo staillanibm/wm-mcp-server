@@ -124,6 +124,29 @@ impl ISClient {
             serde_json::from_str(&text).map_err(|e| e.to_string())
         }
     }
+
+    /// Like `invoke_post`, but for IS services whose response body is NOT JSON.
+    ///
+    /// `wm.task.executor:textreport` returns plain text and `:junitxmlreport`
+    /// returns XML. Parsing those as JSON fails on the very first character
+    /// ("expected value at line 1 column 1") even when the run succeeded, which
+    /// made both reports unusable. Return the body verbatim instead, wrapped in
+    /// a JSON envelope so the tool layer still has a `Value` to hand back.
+    pub(crate) async fn invoke_post_raw(
+        &self,
+        service: &str,
+        payload: &Value,
+    ) -> Result<Value, String> {
+        let r = self
+            .client
+            .post(self.url(&format!("/invoke/{service}")))
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let text = read_checked(r).await?;
+        Ok(json!({"status": "ok", "report": text}))
+    }
 }
 
 /// Read a response body, converting any non-2xx status into an error that
