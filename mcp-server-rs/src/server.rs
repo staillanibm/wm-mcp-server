@@ -224,13 +224,15 @@ impl WmServer {
         json_result(&c.node_get(&p.name).await.map_err(mcp_err)?)
     }
 
-    #[tool(description = "Delete a node (service, folder, document type).")]
+    #[tool(
+        description = "Delete a node (service, folder, document type).\n\nPass `package`: the IS needs it to resolve the node's package and take the lock. Without it the call fails with a NullPointerException.\nAs everywhere else, `name` is the namespace path only -- it never contains the package name."
+    )]
     async fn node_delete(
         &self,
         Parameters(p): Parameters<NodeNameParam>,
     ) -> Result<CallToolResult, ErrorData> {
         let c = self.get_client(&p.instance)?;
-        match c.node_delete(&p.name).await {
+        match c.node_delete(&p.name, p.package.as_deref()).await {
             Ok(v) => json_result(&v),
             Err(e) => text_result(&format!("Delete failed: {e}")),
         }

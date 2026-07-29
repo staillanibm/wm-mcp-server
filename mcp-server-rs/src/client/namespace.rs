@@ -31,16 +31,28 @@ impl super::ISClient {
         r.json().await.map_err(|e| e.to_string())
     }
 
-    pub async fn node_delete(&self, name: &str) -> Result<Value, String> {
+    pub async fn node_delete(&self, name: &str, package: Option<&str>) -> Result<Value, String> {
+        // node_pkg is mandatory: wm.server.nsimpl.deleteNode resolves the package to
+        // take the lock, and throws a NullPointerException when it is missing.
+        let mut body = json!({"node_nsName": name});
+        if let Some(pkg) = package {
+            body["node_pkg"] = json!(pkg);
+        }
         let r = self
             .client
             .post(self.url("/invoke/wm.server.ns/deleteNode"))
-            .json(&json!({"node_nsName": name}))
+            .json(&body)
             .send()
             .await
             .map_err(|e| e.to_string())?;
-        super::read_checked(r).await?;
-        Ok(json!({"status": "deleted", "node": name}))
+        let text = super::read_checked(r).await?;
+        // The IS answers HTTP 200 with status "true"/"false": a refused delete must
+        // not be reported as a success, so surface its actual response.
+        let resp: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        if resp.get("status").and_then(|s| s.as_str()) == Some("false") {
+            return Err(format!("IS refused the delete: {text}"));
+        }
+        Ok(resp)
     }
 
     pub async fn folder_create(&self, package: &str, folder_path: &str) -> Result<Value, String> {

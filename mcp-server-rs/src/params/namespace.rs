@@ -17,6 +17,10 @@ pub struct NodeListParam {
 pub struct NodeNameParam {
     #[schemars(description = "Full namespace path (e.g., \"claudedemo.services:helloWorld\")")]
     pub name: String,
+    #[schemars(
+        description = "Package name owning the node. Required by node_delete (the IS resolves the package to take the lock; omitting it fails with a NullPointerException). Ignored by node_get."
+    )]
+    pub package: Option<String>,
     #[schemars(description = "Target IS instance name (omit for default)")]
     pub instance: Option<String>,
 }
