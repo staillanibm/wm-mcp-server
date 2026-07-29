@@ -228,7 +228,9 @@ WM_SCOPES=readonly          # Only read-only tools (list, get, status)
 WM_SCOPES=fsl-develop       # Only the FSL generate/validate/deploy/test cycle
 ```
 
-Available scopes: `admin`, `develop`, `fsl-develop`, `deploy`, `adapters`, `messaging`, `monitor`, `network`, `readonly`.
+Available scopes: `admin`, `develop`, `fsl-develop`, `unit-test`, `deploy`, `adapters`, `messaging`, `monitor`, `network`, `readonly`.
+
+`unit-test` runs test suites and drives service mocks (`test_run`, `test_check_status`, `test_text_report`, `test_junit_report`, `mock_*`) plus the read-only access needed around them (`node_get`, `node_list`, `fsl_extract`, `service_invoke`, `package_list`, `package_info`, and `package_reload` — mandatory before every run, since a suite added on disk is not picked up otherwise). It deliberately exposes **no namespace mutation** (`put_node`, `fsl_deploy`, `folder_create`, `node_delete`, `package_create`), so it can be handed to a CI agent that must not rewrite the code it tests.
 
 `fsl-develop` is a narrow subset of `develop` scoped to the FSL workflow (`dsl_validate`, `fsl_deploy`, `fsl_extract`, `service_invoke`, `node_list`, `node_get`, `node_delete`, `folder_create`, `package_create`, `package_list`, `package_reload`, `package_info`) — use it to expose FSL generation without pulling in SAP, flat-file, doc-type generation, debugging, or unit-testing tools that `develop` also covers.
 

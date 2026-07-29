@@ -31,18 +31,27 @@ pub fn tool_scope(name: &str) -> &'static [&'static str] {
         // (a subset of "develop", tagged separately so it can be
         // requested on its own without pulling in SAP/flat-file/doc-type
         // generation/debugging/testing tools that "develop" also covers).
-        "dsl_validate" | "fsl_deploy" | "fsl_extract" | "service_invoke" | "node_list"
-        | "node_get" | "node_delete" | "folder_create" => &["fsl-develop", "develop"],
-        "package_create" | "package_list" | "package_reload" | "package_info" => {
-            &["fsl-develop", "develop", "deploy"]
+        "dsl_validate" | "fsl_deploy" | "node_delete" | "folder_create" => {
+            &["fsl-develop", "develop"]
         }
+        // Read-only namespace access: also needed by "unit-test" to inspect the
+        // service under test and compare actual behaviour against expectations.
+        "fsl_extract" | "service_invoke" | "node_list" | "node_get" => {
+            &["fsl-develop", "develop", "unit-test"]
+        }
+        // package_reload is mandatory before every test_run (a suite added on
+        // disk is not picked up otherwise), so "unit-test" needs it too.
+        "package_list" | "package_reload" | "package_info" => {
+            &["fsl-develop", "develop", "deploy", "unit-test"]
+        }
+        "package_create" => &["fsl-develop", "develop", "deploy"],
 
         // ── develop ─────────────────────────────────────────────
         "flow_service_create" | "put_node" | "document_type_create" | "mapset_value" => {
             &["develop"]
         }
         n if n.starts_with("flow_debug_") => &["develop"],
-        n if n.starts_with("test_") || n.starts_with("mock_") => &["develop"],
+        n if n.starts_with("test_") || n.starts_with("mock_") => &["unit-test", "develop"],
         n if n.starts_with("doctype_gen_") || n.starts_with("sap_") => &["develop"],
         n if n.starts_with("ns_dep_") => &["develop"],
         n if n.starts_with("flatfile_") => &["develop"],
@@ -140,6 +149,7 @@ mod tests {
         "admin",
         "develop",
         "fsl-develop",
+        "unit-test",
         "deploy",
         "adapters",
         "messaging",
