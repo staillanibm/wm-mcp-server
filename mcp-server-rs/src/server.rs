@@ -1,6 +1,9 @@
 //! MCP server definition with tool methods.
 
-use crate::client::ISClient;
+use crate::client::{
+    ISClient, SESSION_SCOPE_WARNING, SqlField, SuiteCreateOptions, SuiteMode, TestCaseSpec,
+    junit_markdown, junit_summary, normalize_mock_scope, strip_junit_properties,
+};
 use crate::params::*;
 use rmcp::{
     RoleServer, ServerHandler, handler::server::router::tool::ToolRouter,
@@ -26,6 +29,21 @@ fn text_result(s: &str) -> Result<CallToolResult, ErrorData> {
 
 fn json_result(v: &Value) -> Result<CallToolResult, ErrorData> {
     text_result(&serde_json::to_string_pretty(v).unwrap_or_default())
+}
+
+/// A tool-level failure: `isError: true` so clients stop treating the text
+/// as a successful answer (the MCP way to report an execution error, as
+/// opposed to a JSON-RPC protocol error). The payload is a JSON object
+/// (`{"error": ...}`), or the message itself when it already is JSON (the
+/// structured IS error produced by `service_invoke`).
+fn error_result(msg: &str) -> Result<CallToolResult, ErrorData> {
+    let trimmed = msg.trim();
+    let body = if trimmed.starts_with('{') && serde_json::from_str::<Value>(trimmed).is_ok() {
+        trimmed.to_string()
+    } else {
+        serde_json::to_string_pretty(&json!({"error": msg})).unwrap_or_default()
+    };
+    Ok(CallToolResult::error(vec![Content::text(body)]))
 }
 
 fn parse_json(s: &str) -> Result<Value, String> {
@@ -147,7 +165,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.shutdown(p.bounce.unwrap_or(false)).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Shutdown failed: {e}")),
+            Err(e) => error_result(&format!("Shutdown failed: {e}")),
         }
     }
 
@@ -162,7 +180,9 @@ impl WmServer {
         json_result(&c.package_list().await.map_err(mcp_err)?)
     }
 
-    #[tool(description = "Create and activate a new package.")]
+    #[tool(
+        description = "Create and activate a new package.\n\nA package alone holds nothing: right after creating it, create its single root namespace folder with folder_create -- the package name in lowercase (package \"PetstoreAPI\" -> folder \"petstoreapi\"). Every other folder of that package goes UNDER that root (\"petstoreapi.api\", \"petstoreapi.adapter\"). Never create a bare functional folder such as \"api\" or \"services\" at the top level: the IS namespace is shared by all packages, so those names collide across packages."
+    )]
     async fn package_create(
         &self,
         Parameters(p): Parameters<PackageNameParam>,
@@ -214,7 +234,7 @@ impl WmServer {
     }
 
     #[tool(
-        description = "Get the full definition of a node (service, document, connection).\n\nReturns signature, flow definition, fields, etc."
+        description = "Get the full definition of a node (service, document type, adapter service, connection): signature, flow step tree, fields, lock status. The answer is decoded from IS's XML encoding, so a flow service's flow.nodes is the real nested step tree (the JSON encoding IS uses elsewhere flattens it into the string \"[INVOKE]\"). A missing node answers node: null (HTTP 200) -- use that as the existence check. Read a working node first and copy its shapes when unsure about a put_node payload."
     )]
     async fn node_get(
         &self,
@@ -234,14 +254,14 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.node_delete(&p.name, p.package.as_deref()).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Delete failed: {e}")),
+            Err(e) => error_result(&format!("Delete failed: {e}")),
         }
     }
 
     // ── Folder Management ──────────────────────────────────────────────
 
     #[tool(
-        description = "Create a folder (namespace) in a package. Create parent folders first for nested paths."
+        description = "Create a folder (namespace) in a package.\n\nCreate every parent before its child: \"petstoreapi\", then \"petstoreapi.api\", then \"petstoreapi.api.pets\". A single call does NOT create intermediate folders, and put_node into a missing folder fails with [ISS.0081.9001] Node ... does not exist.\n\nNamespace layout: a package owns exactly ONE top-level folder, named after the package in lowercase, and everything else nests under it. The IS namespace is shared across packages, so top-level \"api\"/\"util\"/\"services\" folders collide between packages."
     )]
     async fn folder_create(
         &self,
@@ -257,7 +277,9 @@ impl WmServer {
 
     // ── Flow Service Management ────────────────────────────────────────
 
-    #[tool(description = "Create an empty flow service. Use put_node to add logic and signature.")]
+    #[tool(
+        description = "Create an empty flow service shell (wm.server.services:serviceAdd). Rarely needed: put_node creates the shell itself when the node does not exist yet. Useful only to reserve a name."
+    )]
     async fn flow_service_create(
         &self,
         Parameters(p): Parameters<FlowServiceCreateParam>,
@@ -271,7 +293,7 @@ impl WmServer {
     }
 
     #[tool(
-        description = "Create or update a namespace node (flow service, document type, etc.) via the IS putNode API.\n\nThis is THE core API for creating flow services with full logic, signatures, and flow steps.\nIt also works for updating document types with field definitions.\n\nThe node_data JSON must follow the IS Values serialization format.\n\nEXAMPLE - Complete flow service with signature and flow logic:\n{\n  \"node_nsName\": \"mypkg.services:greet\",\n  \"node_pkg\": \"MyPackage\",\n  \"node_type\": \"service\",\n  \"svc_type\": \"flow\",\n  \"svc_subtype\": \"default\",\n  \"svc_sigtype\": \"java 3.5\",\n  \"stateless\": \"yes\",\n  \"pipeline_option\": 1,\n  \"svc_sig\": {\n    \"sig_in\": {\n      \"node_type\": \"record\", \"field_type\": \"record\", \"field_dim\": \"0\", \"nillable\": \"true\",\n      \"rec_fields\": [\n        {\"node_type\": \"field\", \"field_name\": \"name\", \"field_type\": \"string\", \"field_dim\": \"0\", \"nillable\": \"true\"}\n      ]\n    },\n    \"sig_out\": {\n      \"node_type\": \"record\", \"field_type\": \"record\", \"field_dim\": \"0\", \"nillable\": \"true\",\n      \"rec_fields\": [\n        {\"node_type\": \"field\", \"field_name\": \"greeting\", \"field_type\": \"string\", \"field_dim\": \"0\", \"nillable\": \"true\"}\n      ]\n    }\n  },\n  \"flow\": {\n    \"type\": \"ROOT\", \"version\": \"3.0\", \"cleanup\": \"true\",\n    \"nodes\": [\n      {\n        \"type\": \"MAP\", \"mode\": \"STANDALONE\",\n        \"nodes\": [\n          {\"type\": \"MAPSET\", \"field\": \"/name;1;0\", \"overwrite\": \"false\",\n           \"d_enc\": \"XMLValues\", \"mapseti18n\": \"true\",\n           \"data\": \"<Values version=\\\"2.0\\\"><value name=\\\"xml\\\">World</value></Values>\"}\n        ]\n      },\n      {\n        \"type\": \"INVOKE\", \"service\": \"pub.string:concat\",\n        \"validate-in\": \"$none\", \"validate-out\": \"$none\",\n        \"nodes\": [\n          {\"type\": \"MAP\", \"mode\": \"INPUT\", \"nodes\": [\n            {\"type\": \"MAPSET\", \"field\": \"/inString1;1;0\", \"overwrite\": \"true\",\n             \"d_enc\": \"XMLValues\", \"mapseti18n\": \"true\",\n             \"data\": \"<Values version=\\\"2.0\\\"><value name=\\\"xml\\\">Hello, </value></Values>\"},\n            {\"type\": \"MAPCOPY\", \"from\": \"/name;1;0\", \"to\": \"/inString2;1;0\"}\n          ]},\n          {\"type\": \"MAP\", \"mode\": \"OUTPUT\", \"nodes\": [\n            {\"type\": \"MAPCOPY\", \"from\": \"/value;1;0\", \"to\": \"/greeting;1;0\"}\n          ]}\n        ]\n      }\n    ]\n  }\n}"
+        description = "Create or update a namespace node (flow service, document type, etc.) via the IS putNode API.\n\nThis is THE core API for creating flow services with full logic, signatures, and flow steps.\nIt also works for updating document types with field definitions.\n\nWhat happens around the raw call (each is the fix for a silent failure seen on IS 12.1):\n1. The flow tree is validated first: a step type the flow compiler does not know (REPEAT, TRY, CATCH, IF ...) or a key it does not read (label-expressions, repeat-interval ...) is refused with the correct spelling, because IS would drop the step and its whole subtree without any error. Retry loop = {\"type\":\"RETRY\",\"count\":\"3\",\"backoff\":\"5\",\"repeat-on\":\"FAILURE\"|\"SUCCESS\"}; BRANCH on expressions = {\"type\":\"BRANCH\",\"evaluate-labels\":\"true\"} with the expression in each child's label; TRY/CATCH = adjacent SEQUENCE steps with \"form\":\"TRY\"/\"CATCH\".\n2. A node that does not exist yet is created first (flow service shell via serviceAdd, any other node_type via makeNode): with watt.server.ns.lockingMode=full, putNode locks the node before writing and a missing node fails with [ISS.0081.9001]. No separate flow_service_create / document_type_create call is needed.\n3. Unless verify=false, the node is read back and the step counts per type are compared with what was sent; the answer carries `verification` and a deficit is an error.\nParent FOLDERS still have to exist (folder_create), node_nsName never contains the package name, and doc types referenced as RecordRef must exist before the service.\n\nThe node_data JSON must follow the IS Values serialization format.\n\nEXAMPLE - Complete flow service with signature and flow logic:\n{\n  \"node_nsName\": \"mypackage.services:greet\",\n  \"node_pkg\": \"MyPackage\",\n  \"node_type\": \"service\",\n  \"svc_type\": \"flow\",\n  \"svc_subtype\": \"default\",\n  \"svc_sigtype\": \"java 3.5\",\n  \"stateless\": \"yes\",\n  \"pipeline_option\": 1,\n  \"svc_sig\": {\n    \"sig_in\": {\n      \"node_type\": \"record\", \"field_type\": \"record\", \"field_dim\": \"0\", \"nillable\": \"true\",\n      \"rec_fields\": [\n        {\"node_type\": \"field\", \"field_name\": \"name\", \"field_type\": \"string\", \"field_dim\": \"0\", \"nillable\": \"true\"}\n      ]\n    },\n    \"sig_out\": {\n      \"node_type\": \"record\", \"field_type\": \"record\", \"field_dim\": \"0\", \"nillable\": \"true\",\n      \"rec_fields\": [\n        {\"node_type\": \"field\", \"field_name\": \"greeting\", \"field_type\": \"string\", \"field_dim\": \"0\", \"nillable\": \"true\"}\n      ]\n    }\n  },\n  \"flow\": {\n    \"type\": \"ROOT\", \"version\": \"3.0\", \"cleanup\": \"true\",\n    \"nodes\": [\n      {\n        \"type\": \"MAP\", \"mode\": \"STANDALONE\",\n        \"nodes\": [\n          {\"type\": \"MAPSET\", \"field\": \"/name;1;0\", \"overwrite\": \"false\",\n           \"d_enc\": \"XMLValues\", \"mapseti18n\": \"true\",\n           \"data\": \"<Values version=\\\"2.0\\\"><value name=\\\"xml\\\">World</value></Values>\"}\n        ]\n      },\n      {\n        \"type\": \"INVOKE\", \"service\": \"pub.string:concat\",\n        \"validate-in\": \"$none\", \"validate-out\": \"$none\",\n        \"nodes\": [\n          {\"type\": \"MAP\", \"mode\": \"INPUT\", \"nodes\": [\n            {\"type\": \"MAPSET\", \"field\": \"/inString1;1;0\", \"overwrite\": \"true\",\n             \"d_enc\": \"XMLValues\", \"mapseti18n\": \"true\",\n             \"data\": \"<Values version=\\\"2.0\\\"><value name=\\\"xml\\\">Hello, </value></Values>\"},\n            {\"type\": \"MAPCOPY\", \"from\": \"/name;1;0\", \"to\": \"/inString2;1;0\"}\n          ]},\n          {\"type\": \"MAP\", \"mode\": \"OUTPUT\", \"nodes\": [\n            {\"type\": \"MAPCOPY\", \"from\": \"/value;1;0\", \"to\": \"/greeting;1;0\"}\n          ]}\n        ]\n      }\n    ]\n  }\n}"
     )]
     async fn put_node(
         &self,
@@ -280,11 +302,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let data = match parse_json(&p.node_data) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
-        match c.put_node(&data).await {
+        match c.put_node(&data, p.verify.unwrap_or(true)).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("putNode failed: {e}")),
+            Err(e) => error_result(&format!("putNode failed: {e}")),
         }
     }
 
@@ -300,7 +322,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.dsl_validate(&p.dsl_text).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("dsl_validate failed: {e}")),
+            Err(e) => error_result(&format!("dsl_validate failed: {e}")),
         }
     }
 
@@ -317,7 +339,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("fsl_deploy failed: {e}")),
+            Err(e) => error_result(&format!("fsl_deploy failed: {e}")),
         }
     }
 
@@ -331,13 +353,15 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.fsl_extract(&p.service_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("fsl_extract failed: {e}")),
+            Err(e) => error_result(&format!("fsl_extract failed: {e}")),
         }
     }
 
     // ── Document Type Management ───────────────────────────────────────
 
-    #[tool(description = "Create a document type. Create parent folders first if needed.")]
+    #[tool(
+        description = "Create an empty document type (then put_node with rec_fields to define the fields, or skip this: put_node creates the record node itself when missing). Idempotent: an existing document type answers status \"exists\". Create parent folders first."
+    )]
     async fn document_type_create(
         &self,
         Parameters(p): Parameters<DocumentTypeCreateParam>,
@@ -352,7 +376,9 @@ impl WmServer {
 
     // ── Service Invocation / Testing ───────────────────────────────────
 
-    #[tool(description = "Invoke (execute/test) a service.")]
+    #[tool(
+        description = "Invoke (execute/test) a service. Inputs: a JSON object mirroring the service signature (adapter services take {\"<svc>Input\": {...}}). A failed invocation is returned with isError and a structured body: error (IS message), errorType, errorMsgId, at (throwing method), cause (e.g. the JDBC SQLState), httpStatus. timeout_secs raises the HTTP timeout for one long-running call."
+    )]
     async fn service_invoke(
         &self,
         Parameters(p): Parameters<ServiceInvokeParam>,
@@ -363,12 +389,15 @@ impl WmServer {
             Some(s) if s.is_empty() => None,
             Some(s) => match parse_json(s) {
                 Ok(v) => Some(v),
-                Err(e) => return text_result(&format!("Invalid JSON input: {e}")),
+                Err(e) => return error_result(&format!("Invalid JSON input: {e}")),
             },
         };
-        match c.service_invoke(&p.service_path, inputs.as_ref()).await {
+        match c
+            .service_invoke(&p.service_path, inputs.as_ref(), p.timeout_secs)
+            .await
+        {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Service invocation failed: {e}")),
+            Err(e) => error_result(&e),
         }
     }
 
@@ -404,7 +433,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.port_get(&p.port_key, &p.pkg).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -418,11 +447,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let data = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.port_add(&data).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -434,11 +463,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let data = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.port_update(&p.port_key, &p.pkg, &data).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -450,7 +479,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.port_enable(&p.port_key, &p.pkg).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -462,7 +491,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.port_disable(&p.port_key, &p.pkg).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -474,7 +503,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.port_delete(&p.port_key, &p.pkg).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -490,12 +519,12 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.adapter_type_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
     #[tool(
-        description = "Get the metadata (available settings/parameters) for creating connections of a specific adapter type.\n\nUse this to discover what connectionSettings parameters are required."
+        description = "Get the metadata (available settings/parameters) for creating connections of a specific adapter type.\n\nCall this BEFORE adapter_connection_create: the `systemName` of each returned property is exactly the key to put in connection_settings, and `resourceDomain` lists the legal values when the property is an enum. Never guess these key names.\n\nadapter_type must come from adapter_type_list (e.g. \"JDBCAdapter\"), not the package name (\"WmJDBCAdapter\" is rejected)."
     )]
     async fn adapter_connection_metadata(
         &self,
@@ -507,7 +536,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -520,7 +549,9 @@ impl WmServer {
         json_result(&c.adapter_connection_list().await.map_err(mcp_err)?)
     }
 
-    #[tool(description = "Create an adapter connection via WmART API.")]
+    #[tool(
+        description = "Create an adapter connection node (WmART createConnectionNode). Full recipe and troubleshooting: resource wm://docs/adapter-connection-reference.\n\nThree rules that cause every failure:\n1. adapter_type is the ADAPTER TYPE, not the package: \"JDBCAdapter\" works, \"WmJDBCAdapter\" returns 500 [ART.114.232].\n2. connection_settings keys are the property systemNames returned by adapter_connection_metadata (JDBC: transactionType, driverType, datasourceClass, serverName, portNumber, databaseName, user, password). A JDBC URL, dbUrl, uid/pwd or host/port/database will NOT work.\n3. connection_alias carries no package prefix: \"petstoreapi.connections:petstore\" (existing folders, lowercase root), not \"PetstoreAPI.connections:petstore\" (that silently creates a folder named PetstoreAPI).\n\nThe node is created DISABLED -- call adapter_connection_enable afterwards, then adapter_connection_state to confirm.\n\nWorking PostgreSQL example:\n  adapter_type = \"JDBCAdapter\"\n  connection_factory_type = \"com.wm.adapter.wmjdbc.connection.JDBCConnectionFactory\"\n  connection_settings = {\"transactionType\":\"LOCAL_TRANSACTION\",\"driverType\":\"Default\",\"datasourceClass\":\"com.wm.dd.jdbcx.postgresql.PostgreSQLDataSource\",\"serverName\":\"localhost\",\"portNumber\":\"5432\",\"databaseName\":\"petstore\",\"user\":\"postgres\",\"password\":\"secret\",\"networkProtocol\":\"\",\"otherProperties\":\"\"}"
+    )]
     async fn adapter_connection_create(
         &self,
         Parameters(p): Parameters<AdapterConnectionCreateParam>,
@@ -528,7 +559,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.connection_settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         let pool_min = p.pool_min.unwrap_or(1);
         let pool_max = p.pool_max.unwrap_or(10);
@@ -554,7 +585,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -566,7 +597,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.adapter_connection_enable(&p.connection_alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -578,7 +609,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.adapter_connection_disable(&p.connection_alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -590,7 +621,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.adapter_connection_state(&p.connection_alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -617,7 +648,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_optional_json(&p.listener_settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c
             .adapter_listener_create(
@@ -630,7 +661,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -642,7 +673,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.adapter_listener_enable(&p.listener_alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -654,14 +685,14 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.adapter_listener_disable(&p.listener_alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
     // ── Adapter Service Management ─────────────────────────────────────
 
     #[tool(
-        description = "Create an adapter service (JDBC Select, Insert, CustomSQL, etc.).\n\nCommon JDBC templates:\n- com.wm.adapter.wmjdbc.services.Select\n- com.wm.adapter.wmjdbc.services.Insert\n- com.wm.adapter.wmjdbc.services.Update\n- com.wm.adapter.wmjdbc.services.Delete\n- com.wm.adapter.wmjdbc.services.CustomSQL\n- com.wm.adapter.wmjdbc.services.StoredProcedure\n- com.wm.adapter.wmjdbc.services.DynamicSQL"
+        description = "Create an adapter service (JDBC Select, Insert, CustomSQL, etc.) from raw template properties. The node's existence is verified afterwards: wm.art.dev.service:createAdapterServiceNode answers HTTP 200 even when the Adapter Runtime refused the node, so a missing node is reported as an error together with the matching server.log lines. Empty JSON arrays in the settings are removed before the call (they arrive as Object[] and are refused with [ART.114.542] argument type mismatch). For JDBC CustomSQL and BatchInsert use jdbc_custom_sql_create / jdbc_batch_insert_create instead -- they build the ~30 properties from the SQL or the table. Settings reference: wm://docs/adapter-service-reference.\n\nCommon JDBC templates:\n- com.wm.adapter.wmjdbc.services.Select\n- com.wm.adapter.wmjdbc.services.Insert\n- com.wm.adapter.wmjdbc.services.BatchInsert\n- com.wm.adapter.wmjdbc.services.Update\n- com.wm.adapter.wmjdbc.services.Delete\n- com.wm.adapter.wmjdbc.services.CustomSQL\n- com.wm.adapter.wmjdbc.services.StoredProcedure\n- com.wm.adapter.wmjdbc.services.DynamicSQL"
     )]
     async fn adapter_service_create(
         &self,
@@ -670,7 +701,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_optional_json(&p.adapter_service_settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c
             .adapter_service_create(
@@ -683,7 +714,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -712,7 +743,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_optional_json(&p.notification_settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c
             .adapter_notification_create_polling(
@@ -725,7 +756,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -739,7 +770,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_optional_json(&p.notification_settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c
             .adapter_notification_create_listener(
@@ -752,7 +783,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -768,7 +799,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.adapter_service_template_list(&p.connection_alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -785,7 +816,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -800,7 +831,7 @@ impl WmServer {
         let values = match &p.values {
             Some(s) => match parse_json(s) {
                 Ok(v) => Some(v),
-                Err(e) => return text_result(&e),
+                Err(e) => return error_result(&e),
             },
             None => None,
         };
@@ -814,7 +845,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -826,12 +857,12 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.adapter_service_get(&p.service_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
     #[tool(
-        description = "Update an existing adapter service's configuration (connection, settings)."
+        description = "Update an existing adapter service's configuration (connection, settings). The node is locked for edit around the update (Designer semantics) and unlocked afterwards. Send the COMPLETE adapterServiceSettings (fetch them with adapter_service_get, then modify): the update replaces the template properties. int/boolean properties such as select.maxRow, select.queryTimeOut and select.autoDelete must be JSON STRINGS (\"0\", \"-1\", \"false\"); a JSON number arrives as a Long and is rejected with [ART.114.238]. JDBC Select services need select.sortOrder (one \"\" per select.expression), otherwise every invocation fails with 'this.sortOrder is null'. Where-clause layout: resource wm://docs/adapter-service-reference."
     )]
     async fn adapter_service_update(
         &self,
@@ -840,16 +871,116 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.adapter_service_update(&p.service_name, &settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
     // ── Streaming Connection Aliases ──────────────────────────────────
 
+    #[tool(
+        description = "Create a JDBC CustomSQL adapter service from an SQL statement -- the Designer wizard as one call. Builds the ~30 template properties (colInfo, input/output arrays, results[] signature, credentials override), creates the node, and verifies it exists. Inputs are the ? bind parameters in order ({name, jdbc_type[, java_type]}); outputs are the result columns, taken from the adapter's own SQL analysis (customSQLcolInfo) when omitted -- that analysis returns -1 for joins with aliases, subqueries, functions and ||, then pass outputs explicitly. java.lang.String works for every JDBC type (TIMESTAMP as yyyy-MM-dd HH:mm:ss.SSS, BOOLEAN as true/false). Signature: <svc>Input/{inputs} -> <svc>Output/results[]/{outputs} (empty list when no row) plus <svc>Output/<result_row_field> when set (INSERT/UPDATE row count). Invoke with service_invoke {\"<svc>Input\": {...}}. Reference: wm://docs/adapter-service-reference."
+    )]
+    async fn jdbc_custom_sql_create(
+        &self,
+        Parameters(p): Parameters<JdbcCustomSqlCreateParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = self.get_client(&p.instance)?;
+        let parse_fields =
+            |s: &Option<String>, what: &str| -> Result<Option<Vec<SqlField>>, String> {
+                let Some(text) = s.as_deref().filter(|t| !t.trim().is_empty()) else {
+                    return Ok(None);
+                };
+                let v = parse_json(text)?;
+                let items = v.as_array().ok_or_else(|| {
+                    format!("{what} must be a JSON array of {{name, jdbc_type}} objects")
+                })?;
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| SqlField::from_json(f, what, i))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Some)
+            };
+        let inputs = match parse_fields(&p.inputs, "inputs") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        let outputs = match parse_fields(&p.outputs, "outputs") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        match c
+            .jdbc_custom_sql_create(
+                &p.service_name,
+                &p.package_name,
+                &p.connection_alias,
+                &p.sql,
+                inputs,
+                outputs,
+                p.result_row_field.as_deref(),
+                p.max_row.as_deref(),
+                p.query_timeout.as_deref(),
+            )
+            .await
+        {
+            Ok(v) => json_result(&v),
+            Err(e) => error_result(&format!("jdbc_custom_sql_create failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Create a JDBC BatchInsert adapter service for one table -- the Designer wizard as one call. Columns and SQL types come from the connection's columnInfo lookup, JDBC type names from the adapter's updateJDBCTypes lookup; serial/identity/defaulted columns go in exclude_columns. Creates the node and verifies it exists. Signature: <svc>Input/inputs[] (a document LIST, one document per row, String fields named after the columns) -> <svc>Output/updateCount[]. One invocation = one executeBatch (about 20 000 rows per call is a good batch on PostgreSQL; add otherProperties=BatchPerformanceWorkaround=true on the DataDirect connection). A missing inputs list makes the driver fail with 'Invalid parameter binding(s)'. Reference: wm://docs/adapter-service-reference."
+    )]
+    async fn jdbc_batch_insert_create(
+        &self,
+        Parameters(p): Parameters<JdbcBatchInsertCreateParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = self.get_client(&p.instance)?;
+        let parse_names = |s: &Option<String>, what: &str| -> Result<Option<Vec<String>>, String> {
+            let Some(text) = s.as_deref().filter(|t| !t.trim().is_empty()) else {
+                return Ok(None);
+            };
+            let v = parse_json(text)?;
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .map(Some)
+                .ok_or_else(|| format!("{what} must be a JSON array of column names"))
+        };
+        let exclude = match parse_names(&p.exclude_columns, "exclude_columns") {
+            Ok(v) => v.unwrap_or_default(),
+            Err(e) => return error_result(&e),
+        };
+        let include = match parse_names(&p.include_columns, "include_columns") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        match c
+            .jdbc_batch_insert_create(
+                &p.service_name,
+                &p.package_name,
+                &p.connection_alias,
+                p.catalog.as_deref(),
+                &p.schema,
+                &p.table,
+                &exclude,
+                include.as_deref(),
+                p.query_timeout.as_deref(),
+            )
+            .await
+        {
+            Ok(v) => json_result(&v),
+            Err(e) => error_result(&format!("jdbc_batch_insert_create failed: {e}")),
+        }
+    }
     #[tool(description = "List all streaming connection aliases (Kafka, etc.) with their status.")]
     async fn streaming_connection_list(
         &self,
@@ -858,7 +989,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_connection_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -888,7 +1019,7 @@ impl WmServer {
         }
         match c.streaming_connection_create(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -900,7 +1031,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_connection_enable(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -912,7 +1043,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_connection_disable(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -924,7 +1055,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_connection_delete(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -938,7 +1069,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_connection_test(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -950,7 +1081,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_providers().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -966,7 +1097,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_event_source_list(p.alias_name.as_deref()).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1004,7 +1135,7 @@ impl WmServer {
         }
         match c.streaming_event_source_create(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1019,7 +1150,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1033,7 +1164,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_trigger_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1045,7 +1176,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_trigger_enable(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1057,7 +1188,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_trigger_disable(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1069,7 +1200,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.streaming_trigger_suspend(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1083,7 +1214,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jndi_alias_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1097,11 +1228,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jndi_alias_set(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1113,7 +1244,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jndi_alias_get(&p.jndi_alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1125,7 +1256,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jndi_alias_delete(&p.jndi_alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1139,7 +1270,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jndi_test_lookup(&p.jndi_alias_name, &p.lookup_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1153,7 +1284,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jndi_templates().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1167,7 +1298,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_connection_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1181,11 +1312,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jms_connection_create(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1197,11 +1328,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jms_connection_update(&p.alias_name, &settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1213,7 +1344,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_connection_delete(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1225,7 +1356,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_connection_enable(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1237,7 +1368,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_connection_disable(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1249,7 +1380,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_trigger_report().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1263,11 +1394,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jms_trigger_create(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1279,11 +1410,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jms_trigger_update(&p.trigger_name, &settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1295,7 +1426,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_trigger_delete(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1307,7 +1438,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_trigger_enable(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1319,7 +1450,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_trigger_disable(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1331,7 +1462,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_trigger_suspend(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1343,7 +1474,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jms_destination_list(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1357,7 +1488,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mqtt_connection_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1371,11 +1502,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.mqtt_connection_create(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1387,11 +1518,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.mqtt_connection_update(&p.alias_name, &settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1403,7 +1534,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mqtt_connection_delete(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1415,7 +1546,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mqtt_connection_enable(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1427,7 +1558,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mqtt_connection_disable(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1439,7 +1570,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mqtt_trigger_report().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1453,11 +1584,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.mqtt_trigger_create(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1469,7 +1600,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mqtt_trigger_delete(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1481,7 +1612,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mqtt_trigger_enable(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1493,7 +1624,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mqtt_trigger_disable(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1505,7 +1636,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mqtt_trigger_suspend(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1519,7 +1650,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.scheduler_state().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1533,7 +1664,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.scheduler_task_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1547,11 +1678,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.scheduler_task_add(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1563,7 +1694,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.scheduler_task_get(&p.oid).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1575,11 +1706,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.scheduler_task_update(&p.oid, &settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1591,7 +1722,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.scheduler_task_cancel(&p.oid).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1603,7 +1734,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.scheduler_task_suspend(&p.oid).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1615,7 +1746,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.scheduler_task_resume(&p.oid).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1627,7 +1758,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.scheduler_pause().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1639,7 +1770,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.scheduler_resume().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1653,7 +1784,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.user_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1665,7 +1796,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.user_add(&p.username, &p.password).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1677,7 +1808,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.user_delete(&p.username).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1689,7 +1820,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.user_set_disabled(&p.username, p.disabled).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1701,7 +1832,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.disabled_user_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1713,7 +1844,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.group_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1725,7 +1856,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.group_add(&p.groupname).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1737,7 +1868,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.group_delete(&p.groupname).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1751,11 +1882,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let membership = match parse_json(&p.membership) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.group_change(&p.groupname, &membership).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1767,7 +1898,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.acl_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1781,11 +1912,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.acl_add(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1797,7 +1928,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.acl_delete(&p.acl_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1811,7 +1942,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.account_locking_get().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1825,7 +1956,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jdbc_pool_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1839,11 +1970,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jdbc_pool_add(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1855,11 +1986,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jdbc_pool_update(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1871,7 +2002,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jdbc_pool_delete(&p.pool).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1885,11 +2016,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jdbc_pool_test(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1901,7 +2032,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jdbc_pool_restart(&p.pool).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1913,7 +2044,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jdbc_driver_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1927,7 +2058,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jdbc_function_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1941,7 +2072,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.global_var_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1953,7 +2084,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.global_var_get(&p.key).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1968,7 +2099,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1980,7 +2111,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.global_var_edit(&p.key, &p.value).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -1992,7 +2123,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.global_var_remove(&p.key).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2008,7 +2139,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_health().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2020,7 +2151,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_stats().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2032,7 +2163,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_settings().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2046,7 +2177,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_extended_settings().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2060,7 +2191,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_service_stats(p.service_name.as_deref()).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2074,7 +2205,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_thread_dump().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2086,7 +2217,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_session_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2098,12 +2229,12 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_license_info().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
     #[tool(
-        description = "Get the IS server log. Optionally specify num_lines to get only the last N lines."
+        description = "Tail of the IS server.log (default 200 entries, oldest first). This is where the Adapter Runtime reports refused adapter services ([ART.117.4030]) and where flow compile problems land -- read it whenever a tool answered OK but the node or behaviour is missing."
     )]
     async fn server_log(
         &self,
@@ -2112,7 +2243,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_log(p.num_lines.as_deref()).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2126,7 +2257,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_circuit_breaker_stats().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2140,7 +2271,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.remote_server_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2154,11 +2285,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.remote_server_add(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2170,7 +2301,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.remote_server_delete(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2182,7 +2313,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.remote_server_test(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2196,7 +2327,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.audit_logger_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2208,7 +2339,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.audit_logger_get(&p.logger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2220,11 +2351,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.audit_logger_update(&p.logger_name, &settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2236,7 +2367,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.audit_logger_enable(&p.logger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2248,7 +2379,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.audit_logger_disable(&p.logger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2262,7 +2393,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.oauth_settings_get().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2274,11 +2405,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.oauth_settings_update(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2290,7 +2421,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.oauth_client_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2304,11 +2435,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.oauth_client_register(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2320,7 +2451,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.oauth_client_delete(&p.client_id).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2332,7 +2463,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.oauth_scope_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2346,11 +2477,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.oauth_scope_add(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2362,7 +2493,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.oauth_scope_remove(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2374,7 +2505,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.oauth_token_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2388,7 +2519,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ws_provider_endpoint_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2400,7 +2531,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ws_consumer_endpoint_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2412,7 +2543,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ws_wsdl_get(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2424,7 +2555,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.rest_resource_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2438,7 +2569,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.openapi_doc_get(&p.rad_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2452,11 +2583,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.openapi_generate_provider(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2470,11 +2601,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.openapi_generate_consumer(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2486,11 +2617,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.openapi_refresh_provider(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2504,7 +2635,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.keystore_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2518,7 +2649,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.truststore_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2532,7 +2663,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.security_settings_get().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2544,11 +2675,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.security_settings_update(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2564,7 +2695,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.package_delete(&p.package_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2578,7 +2709,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.package_info(&p.package_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2590,7 +2721,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.package_dependencies(&p.package_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2602,7 +2733,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.package_jar_list(&p.package_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2621,7 +2752,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2643,7 +2774,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2658,7 +2789,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2675,7 +2806,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2704,7 +2835,7 @@ impl WmServer {
         }
         match c.sap_idoc_doctype_create(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2727,7 +2858,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2741,7 +2872,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.url_alias_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2755,11 +2886,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.url_alias_add(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2771,7 +2902,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.url_alias_get(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2783,7 +2914,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.url_alias_delete(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2807,7 +2938,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2824,7 +2955,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2839,7 +2970,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2850,7 +2981,7 @@ impl WmServer {
         let c = self.get_client(&None)?;
         match c.marketplace_categories(None).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2859,7 +2990,7 @@ impl WmServer {
         let c = self.get_client(&None)?;
         match c.marketplace_registries().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2876,7 +3007,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2893,7 +3024,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2907,7 +3038,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.trigger_report().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2921,11 +3052,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.trigger_create(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2937,7 +3068,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.trigger_delete(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2951,7 +3082,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.trigger_get_properties(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2963,11 +3094,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let props = match parse_json(&p.properties) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.trigger_set_properties(&p.trigger_name, &props).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2979,7 +3110,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.trigger_suspend(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -2993,7 +3124,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.trigger_processing_status(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3005,7 +3136,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.trigger_retrieval_status(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3019,7 +3150,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.trigger_stats(&p.trigger_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3033,7 +3164,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.messaging_connection_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3047,11 +3178,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let settings = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.messaging_connection_create(&settings).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3063,7 +3194,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.messaging_connection_delete(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3075,7 +3206,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.messaging_connection_enable(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3087,7 +3218,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.messaging_connection_disable(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3101,7 +3232,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.messaging_publishable_doctypes().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3115,7 +3246,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.messaging_csq_count(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3127,7 +3258,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.messaging_csq_clear(&p.alias_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3144,7 +3275,7 @@ impl WmServer {
         let pipeline = match &p.pipeline {
             Some(s) if !s.is_empty() => match parse_json(s) {
                 Ok(v) => Some(v),
-                Err(e) => return text_result(&format!("Invalid pipeline JSON: {e}")),
+                Err(e) => return error_result(&format!("Invalid pipeline JSON: {e}")),
             },
             _ => None,
         };
@@ -3157,7 +3288,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3171,7 +3302,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.flow_debug_execute(&p.debug_oid, &p.command).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3183,7 +3314,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.flow_debug_close(&p.debug_oid).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3195,11 +3326,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let bp = match parse_json(&p.breakpoints) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.flow_debug_insert_breakpoints(&p.debug_oid, &bp).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3211,7 +3342,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.flow_debug_remove_all_breakpoints(&p.debug_oid).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3223,11 +3354,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let pipe = match parse_json(&p.pipeline) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.flow_debug_set_pipeline(&p.debug_oid, &pipe).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3239,7 +3370,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.flow_debug_stop_service(&p.debug_oid).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3255,7 +3386,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let packages = match parse_json(&p.test_suite_packages) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c
             .test_run(
@@ -3266,11 +3397,13 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
-    #[tool(description = "Check the status of a test execution (RUNNING, COMPLETED, FAILED).")]
+    #[tool(
+        description = "Check the status of a test execution: NEW, INVOKED, INPROGRESS, COMPLETED, ERROR, or UNAVAILABLE (unknown executionID). Reports can be fetched once the status is COMPLETED."
+    )]
     async fn test_check_status(
         &self,
         Parameters(p): Parameters<TestExecutionIdParam>,
@@ -3278,57 +3411,175 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.test_check_status(&p.execution_id).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
-    #[tool(description = "Get a human-readable text report for a test execution.")]
+    #[tool(
+        description = "Show the report of a test execution in a readable form, built from the JUnit XML: overall verdict and totals, then one table per suite listing every test case with its result (PASS / FAIL / ERROR / SKIP), duration and failure message. format=markdown (default, ready to display) or json (structured: totals, suites[].cases[] with status/message/type/detail). Use it right after test_run; needs status COMPLETED. test_text_report gives the raw text with stack traces, test_junit_report the raw XML for CI."
+    )]
+    async fn test_report(
+        &self,
+        Parameters(p): Parameters<TestReportParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = self.get_client(&p.instance)?;
+        match c.test_junit_report(&p.execution_id).await {
+            Ok(xml) => {
+                let summary = junit_summary(&xml);
+                if p.format
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|f| f.eq_ignore_ascii_case("json"))
+                {
+                    json_result(&summary)
+                } else {
+                    text_result(&junit_markdown(&summary, &p.execution_id))
+                }
+            }
+            Err(e) => error_result(&format!("Failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Get the plain-text JUnit report of a test execution: summary line (Tests run / Failures / Errors), per-test results, failure messages and stack traces.\n\nReturned as raw text (the IS answers text/plain, not JSON). Only available once test_check_status reports COMPLETED; an unknown or still running executionID yields 'Report ... unavailable, or not generated'."
+    )]
     async fn test_text_report(
         &self,
         Parameters(p): Parameters<TestExecutionIdParam>,
     ) -> Result<CallToolResult, ErrorData> {
         let c = self.get_client(&p.instance)?;
         match c.test_text_report(&p.execution_id).await {
-            Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
-        }
-    }
-
-    #[tool(description = "Get a JUnit XML report for a test execution (for CI/CD integration).")]
-    async fn test_junit_report(
-        &self,
-        Parameters(p): Parameters<TestExecutionIdParam>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let c = self.get_client(&p.instance)?;
-        match c.test_junit_report(&p.execution_id).await {
-            Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Ok(report) => text_result(&report),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
     #[tool(
-        description = "Load a service mock.\n\nReplaces the real service with a mock for testing. Scope: 'session' (current session only) or 'global' (all sessions)."
+        description = "Get the JUnit XML report of a test execution (<testsuites>/<testsuite>/<testcase> with <failure>/<error> elements and the run log in <system-out>), for CI/CD integration.\n\nReturned as raw XML text (the IS answers application/xml, not JSON). The <properties> block of each <testsuite> is removed unless include_properties is true. Only available once test_check_status reports COMPLETED."
+    )]
+    async fn test_junit_report(
+        &self,
+        Parameters(p): Parameters<TestJunitReportParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = self.get_client(&p.instance)?;
+        match c.test_junit_report(&p.execution_id).await {
+            Ok(xml) if p.include_properties.unwrap_or(false) => text_result(&xml),
+            Ok(xml) => text_result(&strip_junit_properties(&xml)),
+            Err(e) => error_result(&format!("Failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Create a Unit Test Framework test suite inside an IS package -- the same files Designer's 'New webMethods Test Suite' / 'Generate Tests' produce -- so that test_run can execute it and Designer can open it. Full reference: resource wm://docs/unit-test-reference.\n\nWrites resources/test/setup/<suite_name>.xml plus the pipeline files under resources/test/data/<suite_name>/, on the filesystem when the IS packages directory is reachable from this server, otherwise through pub.file:stringToFile (the packages directory must then be listed in the IS extended setting watt.server.file.canWritePaths).\n\n`tests` is a JSON array of test cases, for example:\n[{\"name\":\"greetAlice\",\"service\":\"utfdemo.services:greet\",\"input\":{\"name\":\"Alice\"},\"expected\":{\"greeting\":\"Hello, Alice\"}},\n {\"name\":\"default\",\"service\":\"utfdemo.services:greet\",\"expected_fields\":[{\"path\":\"/greeting\",\"operator\":\"==\",\"value\":\"Hello, World\"}]},\n {\"name\":\"rejectsNegative\",\"service\":\"utfdemo.services:check\",\"input\":{\"amount\":\"-1\"},\"expected_exception\":{\"message\":\"must be greater\"}},\n {\"name\":\"snapshot\",\"service\":\"utfdemo.services:greet\",\"input\":{\"name\":\"Bob\"},\"record\":true},\n {\"name\":\"isolated\",\"service\":\"utfdemo.services:greet\",\"expected_fields\":[{\"path\":\"/greeting\",\"value\":\"MOCKED\"}],\"mocks\":[{\"service\":\"pub.string:concat\",\"pipeline\":{\"value\":\"MOCKED\"}}]}]\n\nEvery test needs one of: expected (JSON pipeline, compared as a subset of the actual output), expected_fields (JXPath assertions; when present only the fields are evaluated and `expected` merely supplies reference values for fields without `value`), expected_exception, or record=true (invokes the service now, without mocks, with `input` and snapshots its declared outputs -- or its failure -- as the expectation). Optional per test: description, enabled, mocks_enabled, comparator_service (a wm.spec:result_comparator implementation), request_method (invoke|post|get). A mock is {service, then exactly one of pipeline (fixed output), alternate_service (+ optional parms) or exception {class, message}, plus optional scope (session|user|server) and lifetime (test|suite)}. Pipelines are JSON objects: use JSON strings for String fields (\"5\", not 5 -- a JSON number becomes a java.lang.Long that a String-typed flow field silently drops; such values are listed under `warnings` in the response).\n\nmode: create (default, fails if the suite exists), overwrite, or append (adds cases to an existing suite, Designer-made ones included). Verify with test_suite_list, then test_run."
+    )]
+    async fn test_suite_create(
+        &self,
+        Parameters(p): Parameters<TestSuiteCreateParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let tests: Vec<TestCaseSpec> = match serde_json::from_str(&p.tests) {
+            Ok(t) => t,
+            Err(e) => {
+                return error_result(&format!(
+                    "Failed: `tests` must be a JSON array of test case objects: {e}"
+                ));
+            }
+        };
+        let mode = match SuiteMode::parse(p.mode.as_deref()) {
+            Ok(m) => m,
+            Err(e) => return error_result(&format!("Failed: {e}")),
+        };
+        let c = self.get_client(&p.instance)?;
+        let opts = SuiteCreateOptions {
+            package: p.package.trim().to_string(),
+            suite_name: p.suite_name.trim().to_string(),
+            description: p.description.clone(),
+            mocks_enabled: p.mocks_enabled.unwrap_or(true),
+            mode,
+        };
+        match c.test_suite_create(opts, tests).await {
+            Ok(v) => json_result(&v),
+            Err(e) => error_result(&format!("Failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "List the Unit Test Framework suites found in the enabled custom packages (wm.task.asset:suites): suite file, test cases, service under test, expectation and mocks of each. Optional `packages` JSON array to filter. Use it to verify what test_suite_create wrote and to see what test_run will execute."
+    )]
+    async fn test_suite_list(
+        &self,
+        Parameters(p): Parameters<TestSuiteListParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let packages = match parse_optional_json(&p.packages) {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        let c = self.get_client(&p.instance)?;
+        match c.test_suite_list(packages.as_ref()).await {
+            Ok(v) => json_result(&v),
+            Err(e) => error_result(&format!("Failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Read a test suite file or a pipeline file of a package (wm.task.asset:suiteIO). Returns the raw text by default; with as_pipeline=true an IDataXMLCoder pipeline file is decoded into JSON. Paths come from test_suite_list (suitelocation, inputFilename, expectedFilename, pipelineFilename)."
+    )]
+    async fn test_suite_get(
+        &self,
+        Parameters(p): Parameters<TestSuiteGetParam>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let c = self.get_client(&p.instance)?;
+        match c
+            .test_suite_get(
+                p.package.trim(),
+                p.path.trim(),
+                p.as_pipeline.unwrap_or(false),
+            )
+            .await
+        {
+            Ok(Value::String(text)) => text_result(&text),
+            Ok(v) => json_result(&v),
+            Err(e) => error_result(&format!("Failed: {e}")),
+        }
+    }
+
+    #[tool(
+        description = "Load a service mock: every invocation of `service` is replaced by an invocation of the alternate service `mock_object` (it receives the same pipeline).\n\nScope (default 'server'): 'server' = all users and sessions -- the only scope that reliably survives across MCP calls, because each call opens a new IS session; 'user' = all sessions of the IS user the MCP server authenticates as; 'session' = the IS session of this single call, which is closed on return, so the mock is never applied. 'global' is accepted as an alias of 'server'. Server-scoped mocks affect every caller of the IS: mock_clear / mock_clear_all when done."
     )]
     async fn mock_load(
         &self,
         Parameters(p): Parameters<MockLoadParam>,
     ) -> Result<CallToolResult, ErrorData> {
+        let scope = match normalize_mock_scope(p.scope.as_deref()) {
+            Ok(s) => s,
+            Err(e) => return error_result(&format!("Failed: {e}")),
+        };
         let c = self.get_client(&p.instance)?;
-        match c.mock_load(&p.scope, &p.service, &p.mock_object).await {
-            Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+        match c.mock_load(&scope, &p.service, &p.mock_object).await {
+            Ok(mut v) => {
+                if let Some(o) = v.as_object_mut().filter(|_| scope == "session") {
+                    o.insert("warning".into(), json!(SESSION_SCOPE_WARNING));
+                }
+                json_result(&v)
+            }
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
-    #[tool(description = "Clear a specific service mock.")]
+    #[tool(
+        description = "Clear a specific service mock. The scope must be the one the mock was loaded with (default 'server'; 'global' = alias of 'server'): clearing with another scope is a silent no-op on the IS. Use mock_list to see the active mocks per scope."
+    )]
     async fn mock_clear(
         &self,
         Parameters(p): Parameters<MockClearParam>,
     ) -> Result<CallToolResult, ErrorData> {
+        let scope = match normalize_mock_scope(p.scope.as_deref()) {
+            Ok(s) => s,
+            Err(e) => return error_result(&format!("Failed: {e}")),
+        };
         let c = self.get_client(&p.instance)?;
-        match c.mock_clear(&p.scope, &p.service).await {
+        match c.mock_clear(&scope, &p.service).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3340,7 +3591,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mock_clear_all().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3352,7 +3603,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mock_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3364,7 +3615,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mock_suspend().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3376,7 +3627,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.mock_resume().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3392,7 +3643,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let jars = match parse_json(&p.jars) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         let desc = p
             .description
@@ -3403,7 +3654,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3417,7 +3668,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.sftp_server_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3431,11 +3682,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.sftp_server_create(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3447,7 +3698,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.sftp_server_get(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3459,7 +3710,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.sftp_server_delete(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3471,7 +3722,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.sftp_user_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3485,11 +3736,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.sftp_user_create(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3501,7 +3752,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.sftp_user_get(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3513,7 +3764,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.sftp_user_delete(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3525,7 +3776,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.sftp_test_connection(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3539,7 +3790,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.proxy_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3553,11 +3804,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.proxy_create(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3569,7 +3820,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.proxy_get(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3581,7 +3832,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.proxy_delete(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3593,7 +3844,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.proxy_enable(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3605,7 +3856,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.proxy_disable(&p.alias).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3619,7 +3870,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jwt_issuer_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3633,11 +3884,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jwt_issuer_add(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3649,7 +3900,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jwt_issuer_get(&p.issuer_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3661,7 +3912,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jwt_issuer_delete(&p.issuer_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3673,7 +3924,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.jwt_settings_get().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3685,11 +3936,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.jwt_settings_update(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3703,7 +3954,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.quiesce_status().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3717,11 +3968,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.quiesce_enable(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3735,7 +3986,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.quiesce_disable().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3751,7 +4002,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.health_indicators_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3763,7 +4014,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.health_indicator_get(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3775,11 +4026,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.health_indicator_change(&p.name, &s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3793,7 +4044,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.egw_rules_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3805,7 +4056,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.egw_dos_get().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3817,11 +4068,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.egw_dos_update(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3833,7 +4084,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.egw_denied_ip_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3847,7 +4098,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ip_access_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3861,11 +4112,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.ip_access_add(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3877,7 +4128,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ip_access_delete(&p.ip).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3891,7 +4142,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.password_policy_get().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3905,11 +4156,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.password_policy_update(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3923,7 +4174,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.alert_status().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3935,7 +4186,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.alert_enable().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3947,7 +4198,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.alert_disable().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3961,12 +4212,12 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         let port = s.get("port").and_then(|v| v.as_str()).unwrap_or("");
         match c.websocket_sessions_by_port(port).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -3978,7 +4229,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.websocket_close_session(&p.session_id).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4014,7 +4265,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ns_dependency_get_dependents(&p.node_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4026,7 +4277,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ns_dependency_get_references(&p.node_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4038,7 +4289,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ns_dependency_get_unresolved(&p.package_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4053,7 +4304,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4070,7 +4321,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4082,7 +4333,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ns_dependency_refactor(&p.old_name, &p.new_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4101,7 +4352,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4116,7 +4367,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4128,7 +4379,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.flatfile_schema_get(&p.package_name, &p.schema_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4143,7 +4394,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4159,7 +4410,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.package_settings(&p.package_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4171,7 +4422,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.package_compile(&p.package_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4187,7 +4438,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4199,7 +4450,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.package_del_depend(&p.package_name, &p.dependency).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4214,7 +4465,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4229,7 +4480,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4241,7 +4492,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.package_jar_delete(&p.package_name, &p.jar_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4257,11 +4508,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.url_alias_update(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4276,7 +4527,7 @@ impl WmServer {
             .await
         {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4294,11 +4545,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.messaging_publish(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4312,11 +4563,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.messaging_publish_and_wait(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4330,11 +4581,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.messaging_deliver(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4350,7 +4601,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.cache_manager_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4362,7 +4613,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.cache_manager_get(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4374,11 +4625,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.cache_manager_create(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4390,11 +4641,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.cache_manager_update(&p.name, &s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4406,7 +4657,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.cache_manager_delete(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4418,7 +4669,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.cache_reset(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4434,7 +4685,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.saml_issuer_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4446,11 +4697,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.saml_issuer_add(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4462,7 +4713,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.saml_issuer_delete(&p.issuer).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4478,7 +4729,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ldap_settings_get().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4492,11 +4743,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.ldap_server_add(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4508,11 +4759,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.ldap_server_edit(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4524,7 +4775,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ldap_server_delete(&p.server_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4540,7 +4791,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.logger_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4552,7 +4803,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.logger_get(&p.name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4566,11 +4817,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.logger_update(&p.name, &s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4582,7 +4833,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.logger_server_config_get().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4594,11 +4845,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.logger_server_config_update(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4614,7 +4865,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.outbound_password_store(&p.handle, &p.password).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4626,7 +4877,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.outbound_password_retrieve(&p.handle).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4638,7 +4889,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.outbound_password_remove(&p.handle).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4646,19 +4897,32 @@ impl WmServer {
     // ACL Extended (Tier 2)
     // ═══════════════════════════════════════════════════════════════
 
-    #[tool(description = "Assign an ACL to a namespace node (service, document type, etc).")]
+    #[tool(
+        description = "Assign the EXECUTE ACL of a namespace node (service, document type, folder), optionally its LIST/READ/WRITE ACLs (wm.server.access:aclAssign). The IS answers HTTP 200 even when nothing changed, so the tool checks the IS message (\"Changed permissions for ...\") and reads the node back with getNodeNameListForAcl (`verified`). Typical use: expose a service anonymously -> acl_name \"Anonymous\"; note that IS 12.1 intercepts any incoming Authorization: Bearer header on /invoke ([ISS.0010.8044]) so a service cannot host its own bearer-token check."
+    )]
     async fn acl_assign(
         &self,
         Parameters(p): Parameters<AclAssignParam>,
     ) -> Result<CallToolResult, ErrorData> {
         let c = self.get_client(&p.instance)?;
-        match c.acl_assign(&p.node_name, &p.acl_name).await {
+        match c
+            .acl_assign(
+                &p.node_name,
+                &p.acl_name,
+                p.browse_acl.as_deref(),
+                p.read_acl.as_deref(),
+                p.write_acl.as_deref(),
+            )
+            .await
+        {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
-    #[tool(description = "Get list of nodes that have a specific ACL assigned.")]
+    #[tool(
+        description = "List the namespace nodes whose EXECUTE ACL is the given ACL (wm.server.access:getNodeNameListForAcl) -- the read-back for acl_assign."
+    )]
     async fn acl_get_nodes(
         &self,
         Parameters(p): Parameters<AclNameParam>,
@@ -4666,7 +4930,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.acl_get_nodes_for_acl(&p.acl_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4678,7 +4942,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.acl_get_default_access().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4690,11 +4954,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.acl_set_default_access(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4710,11 +4974,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.account_locking_update(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4726,7 +4990,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.account_locking_reset().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4738,7 +5002,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.account_locked_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4750,7 +5014,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.account_unlock(&p.username).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4766,7 +5030,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ip_access_change_type(&p.access_type).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4778,7 +5042,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_thread_interrupt(&p.thread_id).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4790,7 +5054,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_thread_kill(&p.thread_id).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4802,7 +5066,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_session_kill(&p.session_id).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4814,7 +5078,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.server_ssl_cache_clear().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4830,11 +5094,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.egw_rule_add(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4846,7 +5110,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.egw_rule_delete(&p.rule_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4858,11 +5122,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.egw_rule_update(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4878,7 +5142,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.port_access_list().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4890,7 +5154,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.port_access_get(&p.port).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4904,11 +5168,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.port_access_add_nodes(&p.port, &s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4920,7 +5184,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.port_access_delete_node(&p.port, &p.node_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4932,7 +5196,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.port_access_set_type(&p.port, &p.access_type).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4944,7 +5208,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.port_access_reset(&p.port).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4960,11 +5224,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.websocket_endpoint_create(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4976,7 +5240,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.websocket_broadcast(&p.port, &p.message).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -4992,11 +5256,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.ws_consumer_endpoint_add(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -5008,11 +5272,11 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         let s = match parse_json(&p.settings) {
             Ok(v) => v,
-            Err(e) => return text_result(&e),
+            Err(e) => return error_result(&e),
         };
         match c.ws_provider_endpoint_add(&s).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -5024,7 +5288,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ws_consumer_endpoint_delete(&p.endpoint_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -5036,7 +5300,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ws_provider_endpoint_delete(&p.endpoint_name).await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 
@@ -5048,7 +5312,7 @@ impl WmServer {
         let c = self.get_client(&p.instance)?;
         match c.ws_connector_refresh().await {
             Ok(v) => json_result(&v),
-            Err(e) => text_result(&format!("Failed: {e}")),
+            Err(e) => error_result(&format!("Failed: {e}")),
         }
     }
 }
@@ -5117,6 +5381,16 @@ impl ServerHandler for WmServer {
                 "4. adapter_resource_domain_lookup(..., resource_domain_name=\"columnInfo\", values=[\"catalog\",\"schema\",\"table\"]) -> list columns\n",
                 "Use service_template=\"com.wm.adapter.wmjdbc.services.Select\" for querying.\n",
                 "NEVER call service_invoke with made-up IS service paths to browse metadata -- use the tools above.\n\n",
+                "ADAPTER CONNECTION CREATION (prerequisite for every adapter service):\n",
+                "Read 'wm://docs/adapter-connection-reference' before calling adapter_connection_create. Never brute-force its JSON.\n",
+                "1. adapter_type_list -> take adapterName VERBATIM. JDBC is \"JDBCAdapter\"; \"WmJDBCAdapter\" is the PACKAGE and returns 500 [ART.114.232].\n",
+                "2. adapter_connection_metadata(adapter_type, connection_factory_type) -> each property's `systemName` is a connection_settings key.\n",
+                "   JDBC needs: transactionType, driverType, datasourceClass, serverName, portNumber, databaseName, user, password.\n",
+                "   There is NO url/dbUrl/uid/pwd/host/database/driverClass property -- a JDBC URL string is never accepted here.\n",
+                "3. adapter_connection_create(...) with connection_alias = \"pkgroot.folder:name\" (NEVER \"PackageName.folder:name\").\n",
+                "4. adapter_connection_enable(alias) -- the node is created DISABLED and unusable until enabled.\n",
+                "5. adapter_connection_state(alias) -> expect connectionState=enabled.\n",
+                "JDBC adapter connections (created here) are NOT the same thing as internal JDBC pools (jdbc_pool_*, used by IS itself).\n\n",
                 "ADAPTER SERVICE CREATION (Select, Insert, Update, Delete):\n",
                 "IMPORTANT: adapter_service_create creates an EMPTY shell unless you pass complete adapter_service_settings.\n",
                 "You MUST include table and column configuration, otherwise the service will have NO inputs or outputs.\n\n",
@@ -5160,6 +5434,10 @@ impl ServerHandler for WmServer {
                 "and 'wm://docs/putnode-examples' for tested working JSON patterns. Read 'wm://docs/builtin-services' for service signatures.\n\n",
                 "Key rules:\n",
                 "- Services are identified by \"folder.subfolder:serviceName\" paths\n",
+                "- NAMESPACE LAYOUT: the IS namespace is shared by ALL packages. A package owns exactly ONE top-level\n",
+                "  folder, its own name in lowercase, and everything nests under it (PetstoreAPI -> petstoreapi,\n",
+                "  petstoreapi.api, petstoreapi.adapter). Never create a bare \"api\"/\"util\"/\"services\" folder at the\n",
+                "  top level -- it collides with every other package. folder_create makes ONE level per call, parents first.\n",
                 "- NEVER prefix node_nsName with the package name; the package goes ONLY in node_pkg\n",
                 "  (node_nsName is the folder path + service, e.g. orders.api:create, NOT MyPackage.orders.api:create -- prefixing the path with the package causes a 500)\n",
                 "- put_node is the core API for creating/updating flow services with full logic\n",
@@ -5173,7 +5451,7 @@ impl ServerHandler for WmServer {
                 "MARKETPLACE: Use marketplace_search/install to find and install packages from packages.webmethods.io.\n",
                 "JAR INSTALLER: Use install_jars to download JARs from Maven Central and install into IS.\n",
                 "FLOW DEBUGGING: Use flow_debug_start/execute/close to step through services.\n",
-                "UNIT TESTING: Use test_run to execute test suites, mock_load to mock services.\n",
+                "UNIT TESTING: Read 'wm://docs/unit-test-reference' first. test_suite_create writes a Unit Test Framework suite (Designer-compatible XML + pipeline files) into a package, test_suite_list shows what exists, test_run executes it, then test_report (readable per-case table), test_text_report / test_junit_report (raw text/XML). mock_load mocks a service for the whole IS (scope 'server'); mock_clear_all afterwards.\n",
             ))
     }
 

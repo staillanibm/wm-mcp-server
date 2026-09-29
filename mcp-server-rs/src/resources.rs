@@ -13,7 +13,7 @@ pub const RESOURCES: &[DocResource] = &[
     DocResource {
         uri: "wm://docs/flow-language-reference",
         name: "Flow Language Reference",
-        description: "Complete reference for webMethods flow service development via putNode API: step types, WmPath format, mapping rules, LOOP patterns, and working examples.",
+        description: "Complete reference for webMethods flow service development via putNode API: how put_node creates and verifies nodes, step types and their exact keys (RETRY, evaluate-labels), WmPath format, mapping rules, LOOP patterns, and working examples.",
         content: FLOW_LANGUAGE_REF,
     },
     DocResource {
@@ -23,15 +23,21 @@ pub const RESOURCES: &[DocResource] = &[
         content: PUTNODE_EXAMPLES,
     },
     DocResource {
+        uri: "wm://docs/adapter-connection-reference",
+        name: "Adapter Connection Configuration Reference",
+        description: "How to create an adapter connection (JDBC and others) with adapter_connection_create: discovering the real adapter type name and the connectionSettings systemNames, a verified PostgreSQL/SQL Server/Oracle example, the connection-alias namespace rule, enabling the node, and an error-to-cause table.",
+        content: ADAPTER_CONNECTION_REF,
+    },
+    DocResource {
         uri: "wm://docs/adapter-service-reference",
         name: "Adapter Service Configuration Reference",
-        description: "How to create JDBC adapter services with full table/column configuration. Select, Insert, CustomSQL examples with correct adapter_service_settings JSON.",
+        description: "How to create JDBC adapter services: jdbc_custom_sql_create / jdbc_batch_insert_create, verified Select / Insert / CustomSQL / BatchInsert adapter_service_settings JSON, the colInfo and columnInfo formats, array-valued resource-domain lookups ([[...]]), why the ART refuses nodes silently (empty arrays, numbers) and how the tools detect it, transactions.",
         content: ADAPTER_SERVICE_REF,
     },
     DocResource {
         uri: "wm://docs/flow-steps-reference",
         name: "Flow Steps Reference (IBM Docs)",
-        description: "Official IBM documentation for all webMethods flow step types: INVOKE, BRANCH, LOOP, MAP, SEQUENCE, REPEAT, EXIT. Properties, behavior rules, failure conditions, and data mapping concepts.",
+        description: "Official IBM documentation for all webMethods flow step types: INVOKE, BRANCH, LOOP, MAP, SEQUENCE, REPEAT (putNode type RETRY), EXIT. Properties, behavior rules, failure conditions, and data mapping concepts.",
         content: FLOW_STEPS_REF,
     },
     DocResource {
@@ -49,8 +55,14 @@ pub const RESOURCES: &[DocResource] = &[
     DocResource {
         uri: "wm://docs/fsl-language-reference",
         name: "FSL (Flow Service Language) Reference",
-        description: "Text-based DSL syntax for authoring flow services with dsl_validate/fsl_deploy/fsl_extract: interface/service/properties structure, copy vs set, reserved-keyword backtick escaping, semicolon placement rules, EXIT/TRY-CATCH, and a complete worked example.",
+        description: "Text-based DSL syntax for authoring flow services with dsl_validate/fsl_deploy/fsl_extract: when FSL is safe and when to use put_node instead (document lists, WHILE, pub.date are compiled wrong on IS 12.1), interface/service/properties structure, copy vs set, semicolon placement rules, EXIT/TRY-CATCH, and a complete worked example.",
         content: FSL_LANGUAGE_REF,
+    },
+    DocResource {
+        uri: "wm://docs/unit-test-reference",
+        name: "Unit Test Framework Reference",
+        description: "How IS unit tests work today (Unit Test Framework, ex-WmTestSuite: Designer plugin + WmUnitTestManager package) and how to author, run and read them with test_suite_create / test_suite_list / test_run / test_*_report / mock_*: suite JSON spec with examples, generated file layout and XML, comparison semantics, mocks, environment prerequisites and gotchas.",
+        content: UNIT_TEST_REF,
     },
 ];
 
@@ -219,10 +231,66 @@ A service is named by its **folder path**: `folder.subfolder:serviceName`. This 
 NEVER prefix `node_nsName` with the package name -- the package is passed separately in `node_pkg`.
 Folders and packages are different concepts: a node lives *in* a package but is *named* by its folder path.
 
-- Correct:     `node_nsName = "orders.api:create"`, `node_pkg = "MyPackage"`
+- Correct:     `node_nsName = "mypackage.orders.api:create"`, `node_pkg = "MyPackage"`
 - WRONG (500): `node_nsName = "MyPackage.orders.api:create"` (or `"MyPackage:orders.api:create"`)
 
+Why the second form fails: every segment of the path is a **folder that must already exist**.
+`MyPackage` (PascalCase) is a package, not a folder, so putNode reports
+`[ISS.0081.9001] Node MyPackage.orders.api:create does not exist`. The first form works because
+`mypackage` is a real folder you created with `folder_create` -- see the namespace layout below.
+
 The same applies to `folder_create`, `document_type_create` and `node_delete`: the path never contains the package name.
+
+## How put_node writes a node (IS 12.1, `watt.server.ns.lockingMode=full`)
+
+`wm.server.ns:putNode` LOCKS the node before writing, so a node that does not
+exist yet fails with `[ISS.0081.9001] Node x:y does not exist` at
+`nsimpl.lockNode`. The `put_node` tool handles this: when the node is absent
+it first creates the shell (`serviceAdd` for a flow service, `makeNode` for a
+document type or any other `node_type`), then writes the full definition. One
+`put_node` call is therefore enough; `flow_service_create` and
+`document_type_create` are only needed to reserve a name. Parent FOLDERS are
+not created for document types -- `folder_create` them first (a flow service
+shell does create its folder, but do not rely on it: keep the layout below).
+
+After writing, `put_node` reads the node back (as XML -- the only encoding in
+which IS returns the step tree) and compares the number of steps per type
+with what was sent; the answer carries `"verification": {"status": "ok",
+"sent": {...}, "stored": {...}}`. A deficit is an error: IS drops any step
+whose `type` or keys it does not know without a message (see RETRY and
+`evaluate-labels` below), and this check is what catches it. `verify: false`
+skips the readback.
+
+`node_get` uses the same XML readback, so `flow.nodes` is the real nested
+tree. (IS's own JSON encoding renders it as the string `"[INVOKE]"`; that is
+what `fsl_deploy`'s `node` field and raw `getNode` calls show.)
+
+Nodes written this way stay locked by the MCP user (Designer shows a lock
+icon); that is the normal state of a node being edited under `full` locking.
+
+## Namespace layout (create the folders before anything else)
+
+The IS namespace is **shared by all packages** -- a folder path identifies a node globally, and
+the package only says who owns it. So a package must not plant generic folders at the top level:
+two packages both defining `api` or `util` end up interleaved in the same namespace.
+
+Convention: **one root folder per package, the package name in lowercase, everything nested under it.**
+
+```
+package PetstoreAPI          package WxEdiAddon
+  petstoreapi                  wx.edi.addon
+    petstoreapi.api              wx.edi.addon.inbound
+    petstoreapi.adapter          wx.edi.addon.outbound
+    petstoreapi.connections      wx.edi.addon.connections
+```
+
+- Right: `folder_create("PetstoreAPI", "petstoreapi")` then `folder_create("PetstoreAPI", "petstoreapi.api")`
+- Wrong: `folder_create("PetstoreAPI", "api")` -- top-level generic folder, collides across packages
+
+A multi-word package name is split into dotted lowercase segments (`WxEdiAddon` -> `wx.edi.addon`),
+which also groups every package sharing a prefix under one visible tree.
+
+`folder_create` does NOT create intermediate folders: call it once per level, parents first.
 
 ## WmPath Format
 
@@ -244,8 +312,23 @@ All field references in flow services use WmPath format: `/fieldName;type;dim[;d
 - `/myList;1;1` -- string array
 - `/myDoc;2;0` -- anonymous record (scalar)
 - `/myDocs;2;1` -- anonymous record array
-- `/accounts;4;1;mypkg.doctypes:account` -- typed record array (RecordRef to doc type)
-- `/accounts;4;0;mypkg.doctypes:account/customerName;1;0` -- field inside current LOOP iteration element
+- `/accounts;4;1;mypackage.doctypes:account` -- typed record array (RecordRef to doc type)
+- `/accounts;4;0;mypackage.doctypes:account/customerName;1;0` -- field inside current LOOP iteration element
+
+### Indexed access into a list (`results[0]`)
+
+A record list or string list element is addressed with the index right after
+the field name, BEFORE the `;type;dim` suffix, and the dim stays the list's:
+
+```
+/selectPetOutput;2;0/results[0];2;1/name;1;0     -> name of the first row
+/ICValues;2;0/UNB;2;0/UNG[0];2;1/UNG06;1;0        -> Designer-generated example
+```
+
+`results;2;0` (dim 0) does NOT mean "first element": it reads the list as if
+it were a single record and silently yields nothing. Typical JDBC pattern:
+INVOKE the Select, `pub.list:sizeOfList` on `results`, BRANCH on `size`
+(`0` -> EXIT $parent FAILURE into the CATCH), else MAPCOPY from `results[0]`.
 
 ## Flow Step Types
 
@@ -294,7 +377,7 @@ Use type 4 (RecordRef) and `<array>` element in data:
 ```json
 {
   "type": "MAPSET",
-  "field": "/accounts;4;1;mypkg.doctypes:account",
+  "field": "/accounts;4;1;mypackage.doctypes:account",
   "overwrite": "true",
   "d_enc": "XMLValues",
   "mapseti18n": "true",
@@ -343,12 +426,18 @@ Conditional execution based on a field value.
 }
 ```
 Special labels: `$null` (value is null), `$default` (fallback), blank (empty string match).
+Without a `$null` case a null switch value falls into `$default` (verified IS 12.1).
 
 #### BRANCH with label expressions (expression-based branching)
+The key is **`evaluate-labels`** (flow.xml `LABELEXPRESSIONS="true"`). The
+spelling `label-expressions` is silently ignored: the BRANCH is then written
+without switch or expressions and fails at run time with `[ISC.0049.9009]
+Missing required property switch at 'unlabeled BRANCH'`. No `switch` key is
+needed in expression mode.
 ```json
 {
   "type": "BRANCH",
-  "label-expressions": "true",
+  "evaluate-labels": "true",
   "nodes": [
     {"type": "SEQUENCE", "label": "code = 200", "nodes": [/* success */]},
     {"type": "SEQUENCE", "label": "code = 400", "nodes": [/* bad request */]},
@@ -362,28 +451,35 @@ Expressions support: `=`, `!=`, `null`, `$null`, `&&` (use `&amp;&amp;` in XML),
 #### BRANCH with expression-guarded EXIT (conditional loop break)
 ```json
 {
-  "type": "BRANCH", "label-expressions": "true",
+  "type": "BRANCH", "evaluate-labels": "true",
   "nodes": [
     {"type": "EXIT", "label": "%count% >= %limit%", "from": "$loop", "signal": "SUCCESS"}
   ]
 }
 ```
 
-### REPEAT
-Retry/polling step. Re-executes children up to `count` times.
+### REPEAT (putNode type `RETRY`)
+Retry/polling step -- shown as REPEAT in Designer, but its putNode/Values
+type is **`RETRY`** (`com.wm.lang.flow.FlowRetry`, flow.xml `<RETRY COUNT=
+BACK-OFF= LOOP-ON=>`). A node typed `"REPEAT"` is unknown to the flow
+compiler and is dropped WITH ITS WHOLE SUBTREE, silently (HTTP 200, no log
+line); put_node now refuses it before writing.
 ```json
 {
-  "type": "REPEAT",
+  "type": "RETRY",
   "count": "3",
-  "repeat-interval": "5",
+  "backoff": "5",
   "repeat-on": "FAILURE",
   "nodes": [/* steps to retry */]
 }
 ```
-- `repeat-on`: `FAILURE` (retry on error) or `SUCCESS` (poll while succeeding)
-- `count`: max retries (`-1` = unlimited). Supports `%variable%` substitution.
-- `repeat-interval`: seconds between retries
-- `back-off`: multiplier for increasing delay between retries
+- `repeat-on`: `FAILURE` (retry when a child fails) or `SUCCESS` (repeat while
+  children succeed -- polling / batch loop, leave with `EXIT from="$loop"`)
+- `count`: max re-executions (`-1` = unlimited). Supports `%variable%`.
+- `backoff`: seconds between iterations (Designer's "Repeat interval").
+  `repeat-interval` and `back-off` are NOT keys -- ignored silently.
+- `timeout`: optional, seconds (generic step key)
+- `$retries` holds the current iteration inside the loop.
 
 ### SEQUENCE
 Group steps with a label and exit condition.
@@ -480,6 +576,10 @@ Exit from the current flow, loop, or sequence.
 
 `signal` values: `FAILURE` (triggers catch/error), `SUCCESS` (clean exit)
 
+Inside a `SEQUENCE form=TRY`: `EXIT from="$parent" signal="FAILURE"` triggers the adjacent
+CATCH; `EXIT from="$flow"` ends the whole service immediately and BYPASSES the CATCH
+(verified IS 12.1) -- use `$parent` when the CATCH must run (rollback, logging).
+
 EXIT can be a direct child of BRANCH for value-matching:
 ```json
 {"type": "EXIT", "label": "ERR_01", "from": "$flow", "signal": "FAILURE", "failure-message": "API Key invalid"}
@@ -566,7 +666,7 @@ Every service needs input/output signatures:
   "field_type": "recref",
   "field_dim": "1",
   "nillable": "true",
-  "rec_ref": "mypkg.doctypes:account",
+  "rec_ref": "mypackage.doctypes:account",
   "rec_closed": "true"
 }
 ```
@@ -576,7 +676,7 @@ Every service needs input/output signatures:
 Before using RecordRef fields, create the document type:
 ```json
 {
-  "node_nsName": "mypkg.doctypes:account",
+  "node_nsName": "mypackage.doctypes:account",
   "node_pkg": "MyPackage",
   "node_type": "record",
   "field_type": "record",
@@ -598,6 +698,10 @@ Before using RecordRef fields, create the document type:
 5. **INVOKE without INPUT/OUTPUT maps**: The INVOKE nodes array should have MAP mode=INPUT and MAP mode=OUTPUT entries
 6. **Type conversion via intermediary variable (STALE VALUE BUG)**: NEVER create an intermediary variable for type conversion (e.g., long→string). If the source is null/empty, the intermediary retains its previous value from an earlier mapping, producing stale data instead of null. ALWAYS use MAPINVOKE as an inline transformer directly in the MAP step. See correct pattern below.
 7. **No null check before transformation**: When converting types (object→string, long→string, etc.), ALWAYS check for null first. A null value passed to a converter may produce unexpected results or exceptions.
+8. **Whole-record copy then child write in the SAME MAP step**: `MAPCOPY /hdrs;2;0 -> /headers;2;0` followed in the same MAP by a MAPSET/MAPCOPY into `/headers;2;0/Accept;1;0` REPLACES the copied record -- only the child survives. Write the children into the SOURCE record in an earlier MAP, then copy the record alone (verified IS 12.1).
+9. **MAPCOPY then MAPSET overwrite=false on the same target in one MAP step** is unpredictable (sometimes the default wins, sometimes the copy). Use two MAP steps: the copy, then the MAPSET with `overwrite: "false"`.
+10. **Input-map copies stay in the CALLER's pipeline**: variables an INVOKE's INPUT map copies into the called service's inputs remain in the parent pipeline even when the callee drops them at its end. MAPDELETE them in the OUTPUT map of the INVOKE, otherwise secrets (client_secret, tokens) leak into the parent service's output.
+11. **pub.list:appendToDocumentList stores a REFERENCE to `fromItem`**: reusing the same document variable for the next entry overwrites the previous one. MAPDELETE the document after every append (or MAPSET a fresh one).
 
 ### CORRECT: Type conversion with inline MAPINVOKE (no intermediary variable)
 
@@ -606,7 +710,7 @@ Convert a long field directly to a string target using `pub.string:objectToStrin
 ```
 MAP: MAPCOPY /source/longField;3;0 -> /tempObject;3;0   ← intermediary!
 INVOKE: pub.string:objectToString on /tempObject
-MAP: MAPCOPY /value -> /target/stringField;1;0
+MAP: MAPCOPY /string -> /target/stringField;1;0
 ```
 If `longField` is null, `/tempObject` may still hold a value from a previous invocation → stale data.
 
@@ -682,13 +786,15 @@ This checks for null first (`$null` → do nothing, preserving null in target), 
 
 const PUTNODE_EXAMPLES: &str = r#"# putNode Working Examples
 
-All examples below have been tested and verified on IS 11.1.
+All examples below have been tested and verified on IS 11.1 and 12.1. `put_node`
+creates the node when it does not exist (no separate flow_service_create /
+document_type_create call) and verifies the stored step counts afterwards.
 
 ## Example 1: Simple service with MAPSET default value
 
 ```json
 {
-  "node_nsName": "mypkg.services:greet",
+  "node_nsName": "mypackage.services:greet",
   "node_pkg": "MyPackage",
   "node_type": "service",
   "svc_type": "flow",
@@ -747,7 +853,7 @@ This pattern: call a service that returns a record array, loop over it, extract 
 ### Step 1: Document type
 ```json
 {
-  "node_nsName": "mypkg.doctypes:account",
+  "node_nsName": "mypackage.doctypes:account",
   "node_pkg": "MyPackage",
   "node_type": "record",
   "field_type": "record",
@@ -763,7 +869,7 @@ This pattern: call a service that returns a record array, loop over it, extract 
 ### Step 2: Mock service returning record array
 ```json
 {
-  "node_nsName": "mypkg.services:searchAccounts",
+  "node_nsName": "mypackage.services:searchAccounts",
   "node_pkg": "MyPackage",
   "node_type": "service",
   "svc_type": "flow", "svc_subtype": "default", "svc_sigtype": "java 3.5",
@@ -772,13 +878,13 @@ This pattern: call a service that returns a record array, loop over it, extract 
     "sig_in": {"node_type":"record","field_type":"record","field_dim":"0","nillable":"true","javaclass":"com.wm.util.Values","rec_fields":[]},
     "sig_out": {"node_type":"record","field_type":"record","field_dim":"0","nillable":"true","javaclass":"com.wm.util.Values",
       "rec_fields":[
-        {"node_type":"record","field_name":"accounts","field_type":"recref","field_dim":"1","nillable":"true","rec_ref":"mypkg.doctypes:account","rec_closed":"true"}
+        {"node_type":"record","field_name":"accounts","field_type":"recref","field_dim":"1","nillable":"true","rec_ref":"mypackage.doctypes:account","rec_closed":"true"}
       ]
     }
   },
   "flow": {"type":"ROOT","version":"3.2","cleanup":"true","nodes":[
     {"type":"MAP","mode":"STANDALONE","nodes":[
-      {"type":"MAPSET","field":"/accounts;4;1;mypkg.doctypes:account","overwrite":"true","d_enc":"XMLValues","mapseti18n":"true",
+      {"type":"MAPSET","field":"/accounts;4;1;mypackage.doctypes:account","overwrite":"true","d_enc":"XMLValues","mapseti18n":"true",
        "data":"<Values version=\"2.0\"><array name=\"xml\" type=\"record\" depth=\"1\"><record javaclass=\"com.wm.util.Values\"><value name=\"accountName\">acc1</value><value name=\"customerName\">Alice</value></record><record javaclass=\"com.wm.util.Values\"><value name=\"accountName\">acc2</value><value name=\"customerName\">Bob</value></record></array></Values>"}
     ]}
   ]}
@@ -788,7 +894,7 @@ This pattern: call a service that returns a record array, loop over it, extract 
 ### Step 3: Main service with LOOP
 ```json
 {
-  "node_nsName": "mypkg.services:getCustomers",
+  "node_nsName": "mypackage.services:getCustomers",
   "node_pkg": "MyPackage",
   "node_type": "service",
   "svc_type": "flow", "svc_subtype": "default", "svc_sigtype": "java 3.5",
@@ -802,21 +908,21 @@ This pattern: call a service that returns a record array, loop over it, extract 
     }
   },
   "flow": {"type":"ROOT","version":"3.2","cleanup":"true","nodes":[
-    {"type":"INVOKE","service":"mypkg.services:searchAccounts","validate-in":"$none","validate-out":"$none"},
+    {"type":"INVOKE","service":"mypackage.services:searchAccounts","validate-in":"$none","validate-out":"$none"},
     {"type":"LOOP","in-array":"/accounts","out-array":"/customers","nodes":[
       {"type":"MAP","mode":"STANDALONE","nodes":[
-        {"type":"MAPCOPY","from":"/accounts;4;0;mypkg.doctypes:account/customerName;1;0","to":"/customers;1;0"}
+        {"type":"MAPCOPY","from":"/accounts;4;0;mypackage.doctypes:account/customerName;1;0","to":"/customers;1;0"}
       ]}
     ]},
     {"type":"MAP","mode":"STANDALONE","nodes":[
-      {"type":"MAPDELETE","field":"/accounts;4;1;mypkg.doctypes:account"}
+      {"type":"MAPDELETE","field":"/accounts;4;1;mypackage.doctypes:account"}
     ]}
   ]}
 }
 ```
 
 **Key points:**
-- MAPCOPY from path uses type 4 (RecordRef): `/accounts;4;0;mypkg.doctypes:account/customerName;1;0`
+- MAPCOPY from path uses type 4 (RecordRef): `/accounts;4;0;mypackage.doctypes:account/customerName;1;0`
 - Dimension is 0 (current iteration element, not the array)
 - Document type reference is required after the dimension
 - MAPDELETE after LOOP cleans up the temporary array from pipeline output
@@ -828,10 +934,10 @@ This pattern: call a service that returns a record array, loop over it, extract 
   "flow": {"type":"ROOT","version":"3.0","cleanup":"true","nodes":[
     {"type":"BRANCH","switch":"/action","nodes":[
       {"type":"SEQUENCE","label":"create","exit-on":"FAILURE","nodes":[
-        {"type":"INVOKE","service":"mypkg.services:createRecord","validate-in":"$none","validate-out":"$none"}
+        {"type":"INVOKE","service":"mypackage.services:createRecord","validate-in":"$none","validate-out":"$none"}
       ]},
       {"type":"SEQUENCE","label":"delete","exit-on":"FAILURE","nodes":[
-        {"type":"INVOKE","service":"mypkg.services:deleteRecord","validate-in":"$none","validate-out":"$none"}
+        {"type":"INVOKE","service":"mypackage.services:deleteRecord","validate-in":"$none","validate-out":"$none"}
       ]},
       {"type":"SEQUENCE","label":"$default","exit-on":"FAILURE","nodes":[
         {"type":"MAP","mode":"STANDALONE","nodes":[
@@ -852,7 +958,7 @@ Uses type 2 (Record) with nested paths -- NO LOOP needed for single-record acces
 ```json
 {
   "flow": {"type":"ROOT","version":"3.0","cleanup":"true","nodes":[
-    {"type":"INVOKE","service":"mypkg.adapters:getAccountDetails","validate-in":"$none","validate-out":"$none",
+    {"type":"INVOKE","service":"mypackage.adapters:getAccountDetails","validate-in":"$none","validate-out":"$none",
      "nodes":[
        {"type":"MAP","mode":"INPUT","nodes":[
          {"type":"MAPCOPY","from":"/accountID;1;0","to":"/getAccountDetailsInput;2;0/EXTERNAL_ID_1;1;0"}
@@ -903,11 +1009,11 @@ Map JDBC adapter output fields to a typed document. Each field uses full nested 
 
 ```json
 {"type":"MAP","mode":"STANDALONE","nodes":[
-  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/order_id;1;0","to":"/orders;4;0;mypkg.docTypes:OrderCanonical/id;1;0"},
-  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/order_date;1;0","to":"/orders;4;0;mypkg.docTypes:OrderCanonical/date;1;0"},
-  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/status;1;0","to":"/orders;4;0;mypkg.docTypes:OrderCanonical/status;1;0"},
-  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/customer_id;1;0","to":"/orders;4;0;mypkg.docTypes:OrderCanonical/customer;2;0/id;1;0"},
-  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/customer_name;1;0","to":"/orders;4;0;mypkg.docTypes:OrderCanonical/customer;2;0/name;1;0"},
+  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/order_id;1;0","to":"/orders;4;0;mypackage.docTypes:OrderCanonical/id;1;0"},
+  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/order_date;1;0","to":"/orders;4;0;mypackage.docTypes:OrderCanonical/date;1;0"},
+  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/status;1;0","to":"/orders;4;0;mypackage.docTypes:OrderCanonical/status;1;0"},
+  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/customer_id;1;0","to":"/orders;4;0;mypackage.docTypes:OrderCanonical/customer;2;0/id;1;0"},
+  {"type":"MAPCOPY","from":"/selectOrdersOutput;2;0/results;2;0/customer_name;1;0","to":"/orders;4;0;mypackage.docTypes:OrderCanonical/customer;2;0/name;1;0"},
   {"type":"MAPDELETE","field":"/selectOrdersOutput;2;0"}
 ]}
 ```
@@ -928,13 +1034,13 @@ Receive JMS message, extract body, convert to JSON, persist to DB.
     ]}
   ]},
   {"type":"MAP","mode":"STANDALONE","nodes":[
-    {"type":"MAPCOPY","from":"/JMSMessage;4;0;pub.jms:JMSMessage/body;2;0/data;2;0","to":"/order;4;0;mypkg.docTypes:OrderCanonical"},
+    {"type":"MAPCOPY","from":"/JMSMessage;4;0;pub.jms:JMSMessage/body;2;0/data;2;0","to":"/order;4;0;mypackage.docTypes:OrderCanonical"},
     {"type":"MAPDELETE","field":"/JMSMessage;4;0;pub.jms:JMSMessage"}
   ]},
-  {"type":"INVOKE","service":"mypkg.jdbc:createOrder","validate-in":"$none","validate-out":"$none","nodes":[
+  {"type":"INVOKE","service":"mypackage.jdbc:createOrder","validate-in":"$none","validate-out":"$none","nodes":[
     {"type":"MAP","mode":"INPUT","nodes":[
-      {"type":"MAPCOPY","from":"/order;4;0;mypkg.docTypes:OrderCanonical/id;1;0","to":"/createOrderInput;2;0/order_id;1;0"},
-      {"type":"MAPCOPY","from":"/order;4;0;mypkg.docTypes:OrderCanonical/status;1;0","to":"/createOrderInput;2;0/status;1;0"}
+      {"type":"MAPCOPY","from":"/order;4;0;mypackage.docTypes:OrderCanonical/id;1;0","to":"/createOrderInput;2;0/order_id;1;0"},
+      {"type":"MAPCOPY","from":"/order;4;0;mypackage.docTypes:OrderCanonical/status;1;0","to":"/createOrderInput;2;0/status;1;0"}
     ]}
   ]}
 ]}}
@@ -965,7 +1071,7 @@ Convert document to XML, send to JMS queue, return HTTP 202.
 {"flow":{"type":"ROOT","version":"3.2","cleanup":"true","nodes":[
   {"type":"INVOKE","service":"pub.xml:documentToXMLString","validate-in":"$none","validate-out":"$none","nodes":[
     {"type":"MAP","mode":"INPUT","nodes":[
-      {"type":"MAPCOPY","from":"/request;4;0;mypkg.docTypes:OrderRequest","to":"/document;2;0"}
+      {"type":"MAPCOPY","from":"/request;4;0;mypackage.docTypes:OrderRequest","to":"/document;2;0"}
     ]}
   ]},
   {"type":"INVOKE","service":"pub.jms:send","validate-in":"$none","validate-out":"$none","nodes":[
@@ -995,10 +1101,10 @@ Call external REST API, branch on response code, map success/error responses.
       {"type":"MAPSET","field":"/httpMethod;1;0","overwrite":"true","d_enc":"XMLValues","mapseti18n":"true",
        "data":"<Values version=\"2.0\"><value name=\"xml\">POST</value></Values>"},
       {"type":"MAPSET","field":"/radNamespace;1;0","overwrite":"false","d_enc":"XMLValues","mapseti18n":"true",
-       "data":"<Values version=\"2.0\"><value name=\"xml\">mypkg.client:apiDescriptor</value></Values>"}
+       "data":"<Values version=\"2.0\"><value name=\"xml\">mypackage.client:apiDescriptor</value></Values>"}
     ]}
   ]},
-  {"type":"BRANCH","switch":"","label-expressions":"true","nodes":[
+  {"type":"BRANCH","switch":"","evaluate-labels":"true","nodes":[
     {"type":"SEQUENCE","label":"code = 201","exit-on":"FAILURE","nodes":[
       {"type":"MAP","mode":"STANDALONE","nodes":[
         {"type":"MAPCOPY","from":"/response;3;0","to":"/201;2;0"}
@@ -1031,7 +1137,7 @@ Based on obsCustomerManagement:getCustomers pattern.
 
 ```json
 {
-  "node_nsName": "mypkg.services:getResource",
+  "node_nsName": "mypackage.services:getResource",
   "node_pkg": "MyPackage",
   "node_type": "service",
   "svc_type": "flow",
@@ -1083,7 +1189,7 @@ Based on obsCustomerManagement:getCustomers pattern.
           {
             "type": "SEQUENCE", "exit-on": "FAILURE", "comment": "call backend service",
             "nodes": [
-              {"type": "INVOKE", "service": "mypkg.impl:fetchResource", "validate-in": "$none", "validate-out": "$none"},
+              {"type": "INVOKE", "service": "mypackage.impl:fetchResource", "validate-in": "$none", "validate-out": "$none"},
               {"type": "MAP", "mode": "STANDALONE", "nodes": [
                 {"type": "MAPCOPY", "from": "/fetchOutput/data;1;0", "to": "/result;1;0"}
               ]}
@@ -1126,7 +1232,7 @@ Based on obsCustomerManagement:getCustomers pattern.
                    {"type": "MAPCOPY", "from": "/failureMessage;1;0", "to": "/message;1;0"},
                    {"type": "MAPSET", "field": "/function;1;0", "overwrite": "true",
                     "d_enc": "XMLValues", "mapseti18n": "true",
-                    "data": "<Values version=\"2.0\"><value name=\"xml\">mypkg.services:getResource</value></Values>"},
+                    "data": "<Values version=\"2.0\"><value name=\"xml\">mypackage.services:getResource</value></Values>"},
                    {"type": "MAPSET", "field": "/level;1;0", "overwrite": "true",
                     "d_enc": "XMLValues", "mapseti18n": "true",
                     "data": "<Values version=\"2.0\"><value name=\"xml\">Error</value></Values>"}
@@ -1262,15 +1368,17 @@ Clean pipeline keeping only specified variables:
 - `preserve` is a String array (field type `1;1`) listing variable names to keep
 - Everything else is removed from the pipeline
 
-## Example 16: REPEAT step (retry on failure with backoff)
+## Example 16: REPEAT step (putNode type RETRY -- retry on failure with backoff)
 
-Retry a service call up to 3 times with 5-second intervals:
+Retry a service call up to 3 times with 5-second intervals. The step Designer
+calls REPEAT is typed **`RETRY`** in putNode JSON; `"type": "REPEAT"` is unknown
+to the flow compiler and silently discards the step and its children:
 
 ```json
 {
-  "type": "REPEAT", "count": "3", "repeat-interval": "5", "repeat-on": "FAILURE",
+  "type": "RETRY", "count": "3", "backoff": "5", "repeat-on": "FAILURE",
   "nodes": [
-    {"type": "INVOKE", "service": "mypkg.services:callExternalAPI", "validate-in": "$none", "validate-out": "$none"},
+    {"type": "INVOKE", "service": "mypackage.services:callExternalAPI", "validate-in": "$none", "validate-out": "$none"},
     {"type": "BRANCH", "switch": "/responseCode", "nodes": [
       {"type": "SEQUENCE", "label": "200", "exit-on": "FAILURE", "nodes": []},
       {"type": "SEQUENCE", "label": "$default", "exit-on": "FAILURE", "nodes": [
@@ -1281,11 +1389,15 @@ Retry a service call up to 3 times with 5-second intervals:
 }
 ```
 
-**REPEAT rules:**
+**RETRY (REPEAT) rules:**
 - `repeat-on: "FAILURE"` = retry when a child fails (retry pattern for transient errors)
-- `repeat-on: "SUCCESS"` = repeat while children succeed (polling pattern, e.g., JMS receive loop)
-- `count`: max retries. `-1` = unlimited. Supports `%variable%` substitution.
-- EXIT inside REPEAT with `from: "$loop"` breaks out of the retry loop
+- `repeat-on: "SUCCESS"` = repeat while children succeed (polling pattern, batch loop, JMS receive loop)
+- `count`: max re-executions. `-1` = unlimited. Supports `%variable%` substitution.
+- `backoff`: seconds between iterations (Designer "Repeat interval"). `repeat-interval` / `back-off` are ignored.
+- EXIT inside RETRY with `from: "$loop"` breaks out of the loop; `$retries` is the iteration counter.
+- Verified on IS 12.1: `{"type":"RETRY","count":"3","backoff":"1","repeat-on":"SUCCESS"}` around a
+  MAP + `BRANCH evaluate-labels` + `EXIT $loop` writes `<RETRY COUNT="3" BACK-OFF="1" LOOP-ON="SUCCESS">`
+  and leaves the loop on the first iteration when the expression matches.
 
 ## Example 17: LOOP with conditional limit (process at most N items)
 
@@ -1295,11 +1407,11 @@ Process items from an array but stop after a configurable limit:
 {
   "type": "LOOP", "in-array": "/files", "out-array": "/results",
   "nodes": [
-    {"type": "BRANCH", "label-expressions": "true", "nodes": [
+    {"type": "BRANCH", "evaluate-labels": "true", "nodes": [
       {"type": "EXIT", "label": "%processedCount% >= %limit%", "from": "$loop", "signal": "SUCCESS"}
     ]},
     {"type": "SEQUENCE", "exit-on": "FAILURE", "nodes": [
-      {"type": "INVOKE", "service": "mypkg.services:processFile", "validate-in": "$none", "validate-out": "$none"},
+      {"type": "INVOKE", "service": "mypackage.services:processFile", "validate-in": "$none", "validate-out": "$none"},
       {"type": "MAP", "mode": "STANDALONE", "nodes": [
         {"type": "MAPINVOKE", "service": "pub.math:addInts", "validate-in": "$none", "validate-out": "$none", "invoke-order": "0",
          "nodes": [
@@ -1320,7 +1432,7 @@ Process items from an array but stop after a configurable limit:
 }
 ```
 
-**Pattern:** BRANCH with `label-expressions: "true"` at the top of the LOOP body acts as a guard. The EXIT label is evaluated as an expression — when it matches, the loop breaks.
+**Pattern:** BRANCH with `evaluate-labels: "true"` at the top of the LOOP body acts as a guard. The EXIT label is evaluated as an expression — when it matches, the loop breaks.
 
 ## Example 18: BRANCH with expression labels (multi-condition routing)
 
@@ -1328,19 +1440,19 @@ Route processing based on complex conditions:
 
 ```json
 {
-  "type": "BRANCH", "label-expressions": "true",
+  "type": "BRANCH", "evaluate-labels": "true",
   "nodes": [
     {"type": "SEQUENCE", "label": "name != null &amp;&amp; status != null", "exit-on": "FAILURE",
      "comment": "both name and status provided",
-     "nodes": [{"type": "INVOKE", "service": "mypkg.services:searchByNameAndStatus"}]},
+     "nodes": [{"type": "INVOKE", "service": "mypackage.services:searchByNameAndStatus"}]},
     {"type": "SEQUENCE", "label": "name != null", "exit-on": "FAILURE",
      "comment": "only name provided",
-     "nodes": [{"type": "INVOKE", "service": "mypkg.services:searchByName"}]},
+     "nodes": [{"type": "INVOKE", "service": "mypackage.services:searchByName"}]},
     {"type": "SEQUENCE", "label": "status != null", "exit-on": "FAILURE",
      "comment": "only status provided",
-     "nodes": [{"type": "INVOKE", "service": "mypkg.services:searchByStatus"}]},
+     "nodes": [{"type": "INVOKE", "service": "mypackage.services:searchByStatus"}]},
     {"type": "SEQUENCE", "label": "$default", "exit-on": "FAILURE",
-     "nodes": [{"type": "INVOKE", "service": "mypkg.services:searchAll"}]}
+     "nodes": [{"type": "INVOKE", "service": "mypackage.services:searchAll"}]}
   ]
 }
 ```
@@ -1364,7 +1476,7 @@ Structure generated by IS when consuming a WSDL:
      ]},
     {"type": "MAP", "mode": "STANDALONE", "comment": "map request to SOAP body",
      "nodes": [
-       {"type": "MAPCOPY", "from": "/request;4;0;mypkg.docTypes:getCustomerInput", "to": "/request;2;0/getCustomer;2;0"},
+       {"type": "MAPCOPY", "from": "/request;4;0;mypackage.docTypes:getCustomerInput", "to": "/request;2;0/getCustomer;2;0"},
        {"type": "MAPSET", "field": "/soapProtocol;1;0", "overwrite": "true",
         "d_enc": "XMLValues", "mapseti18n": "true",
         "data": "<Values version=\"2.0\"><value name=\"xml\">SOAP 1.1 Protocol</value></Values>"}
@@ -1382,7 +1494,7 @@ Structure generated by IS when consuming a WSDL:
        {"type": "SEQUENCE", "label": "0", "exit-on": "FAILURE", "comment": "success",
         "nodes": [
           {"type": "MAP", "mode": "STANDALONE", "nodes": [
-            {"type": "MAPCOPY", "from": "/response;2;0/getCustomerResponse;2;0", "to": "/result;4;0;mypkg.docTypes:getCustomerOutput"},
+            {"type": "MAPCOPY", "from": "/response;2;0/getCustomerResponse;2;0", "to": "/result;4;0;mypackage.docTypes:getCustomerOutput"},
             {"type": "MAPDELETE", "field": "/response;2;0"},
             {"type": "MAPDELETE", "field": "/soapStatus;1;0"}
           ]}
@@ -1407,6 +1519,139 @@ Structure generated by IS when consuming a WSDL:
 - Fault: extract from `/response;2;0/fault;2;0`
 "#;
 
+const ADAPTER_CONNECTION_REF: &str = r#"# Adapter Connection Configuration Reference
+
+How to create an adapter connection node with `adapter_connection_create`.
+Everything below was verified against a live JDBC Adapter 10.3 / IS 12.
+
+## An adapter connection is NOT a JDBC pool
+
+| | `jdbc_pool_*` | `adapter_connection_*` |
+|---|---|---|
+| What | IS-internal connection pool | JCA connection node owned by an adapter |
+| Used by | the server itself (ISCoreAudit, TN, xref...) | adapter services (Select/Insert/Update/Delete), notifications |
+| Configured with | a JDBC **URL** + **Driver** class (`com.wm.dd.jdbc.*`) | discrete properties + **DataSource** class (`com.wm.dd.jdbcx.*`) |
+| Lives in | `config/jdbc/pool/<name>.xml` | a package namespace, as a node |
+
+`adapter_service_create` can only be built on an adapter connection. A JDBC pool
+will never work there, and the JDBC-pool vocabulary (url, uid, pwd, drivers,
+mincon/maxcon) is rejected by `connection_settings`.
+
+## The 5 rules
+
+1. **`adapter_type` is the adapter type, not the package.** Take it verbatim from
+   `adapter_type_list` -> `adapterName`. JDBC is **`JDBCAdapter`**.
+   `WmJDBCAdapter` is the *package* and fails with
+   `HTTP 500: [ART.114.232] Adapter Runtime (Metadata): Unable to get the adapter type "WmJDBCAdapter".`
+2. **`connection_settings` keys are the `systemName` values returned by
+   `adapter_connection_metadata`.** Call it first; never invent key names.
+   Properties whose metadata carries a `resourceDomain` only accept the listed values.
+3. **`connection_alias` carries no package prefix.** It is the namespace path of
+   the node, so it starts at the package's lowercase root folder:
+   `petstoreapi.connections:petstore`. Writing `PetstoreAPI.connections:petstore`
+   does NOT error -- unlike `put_node`, `createConnectionNode` creates missing
+   folders, so you silently get a folder literally named `PetstoreAPI` and the
+   alias you must use everywhere else changes. The package goes in
+   `package_name`, and there only.
+4. **Creation never validates the settings.** `createConnectionNode` accepts
+   nonsense (even `{}`) and returns HTTP 200. The configuration is only checked
+   when the connection is enabled -- so "created" proves nothing.
+5. **The node is created DISABLED.** Call `adapter_connection_enable`, then
+   `adapter_connection_state` and check `connectionState: enabled` and
+   `hasError: false`.
+
+## Workflow
+
+```
+adapter_type_list                      -> exact adapter type name
+adapter_connection_metadata(type, factory) -> the systemName of every setting
+package_create / folder_create         -> optional, the alias folders are auto-created
+adapter_connection_create(...)         -> node exists, disabled, unvalidated
+adapter_connection_enable(alias)       -> THIS is what validates the settings
+adapter_connection_state(alias)        -> connectionState=enabled, hasError=false
+adapter_resource_domain_lookup(...)    -> proves the DB is really reachable
+```
+
+## JDBC connection settings
+
+`connection_factory_type` = `com.wm.adapter.wmjdbc.connection.JDBCConnectionFactory`
+
+| systemName | Required | Notes |
+|---|---|---|
+| `datasourceClass` | **yes** | The only setting enforced at enable time. A DataSource class, see table below |
+| `serverName` | in practice | DB host |
+| `portNumber` | in practice | as a string: `"5432"` |
+| `databaseName` | in practice | DB / catalog name |
+| `user` | in practice | DB user |
+| `password` | in practice | plaintext here; IS stores it in the outbound password store |
+| `transactionType` | no | `LOCAL_TRANSACTION` \| `XA_TRANSACTION` \| `NO_TRANSACTION` |
+| `driverType` | no | `Default` |
+| `networkProtocol` | no | usually empty |
+| `otherProperties` | no | `property1=value1;property2=value2` |
+
+Pool sizing is NOT part of `connection_settings`: use the `pool_min` / `pool_max`
+parameters of the tool (they map to connectionManagerSettings).
+
+### DataSource classes bundled with webMethods (DataDirect)
+
+| Database | `datasourceClass` |
+|---|---|
+| PostgreSQL | `com.wm.dd.jdbcx.postgresql.PostgreSQLDataSource` |
+| SQL Server | `com.wm.dd.jdbcx.sqlserver.SQLServerDataSource` |
+| Oracle | `com.wm.dd.jdbcx.oracle.OracleDataSource` |
+| DB2 | `com.wm.dd.jdbcx.db2.DB2DataSource` |
+| MySQL | `com.wm.dd.jdbcx.mysql.MySQLDataSource` |
+| Informix | `com.wm.dd.jdbcx.informix.InformixDataSource` |
+| Sybase | `com.wm.dd.jdbcx.sybase.SybaseDataSource` |
+
+Watch the package name: `com.wm.dd.jdbcx.*` -- with an x -- are the DataSource classes
+the adapter needs; `com.wm.dd.jdbc.*` (what `jdbc_driver_list` returns) are Driver
+classes and belong to `jdbc_pool_add`. Passing a Driver class here fails at enable time.
+These DataDirect classes implement `DataSource` + `ConnectionPoolDataSource`, so
+they cover `NO_TRANSACTION` and `LOCAL_TRANSACTION`; `XA_TRANSACTION` requires a
+DataSource class that implements `javax.sql.XADataSource`.
+
+## Verified example -- PostgreSQL
+
+```json
+{
+  "connection_alias": "petstoreapi.connections:petstore",
+  "package_name": "PetstoreAPI",
+  "adapter_type": "JDBCAdapter",
+  "connection_factory_type": "com.wm.adapter.wmjdbc.connection.JDBCConnectionFactory",
+  "connection_settings": "{\"transactionType\":\"LOCAL_TRANSACTION\",\"driverType\":\"Default\",\"datasourceClass\":\"com.wm.dd.jdbcx.postgresql.PostgreSQLDataSource\",\"serverName\":\"localhost\",\"portNumber\":\"5432\",\"databaseName\":\"petstore\",\"user\":\"postgres\",\"password\":\"secret\",\"networkProtocol\":\"\",\"otherProperties\":\"\"}",
+  "pool_min": 1,
+  "pool_max": 10
+}
+```
+
+Then `adapter_connection_enable("petstoreapi.connections:petstore")`, and confirm with
+`adapter_resource_domain_lookup(connection_alias="petstoreapi.connections:petstore",
+service_template="com.wm.adapter.wmjdbc.services.Select",
+resource_domain_name="catalogNames")` -- if it returns the catalog list, the
+connection really talks to the database.
+
+SQL Server differs only in `datasourceClass` +
+`portNumber: "1433"`; Oracle uses `portNumber: "1521"` and often carries the
+service name in `otherProperties` (e.g. `ServiceName=ORCLPDB1`).
+
+## Error to cause
+
+| Message | Cause | Fix |
+|---|---|---|
+| `[ART.114.232] Unable to get the adapter type "X"` | `adapter_type` is a package name or a typo | use `adapter_type_list` -> `adapterName` (`JDBCAdapter`) |
+| `[ADA.1.200] The JDBC DataSource class "" cannot be located` | `datasourceClass` missing, or the whole settings object used the wrong key names | re-read `adapter_connection_metadata`, use the `systemName` keys |
+| `[ADA.1.200] ... class "com.wm.dd.jdbc.X" cannot be located` | a Driver class was passed instead of a DataSource class | use the `com.wm.dd.jdbcx.*` class |
+| `[ART.118.5042] Unable to enable connection resource` | credentials / host / port / database wrong, or DB unreachable | test the same coordinates with `jdbc_pool_test`, check the DB is up |
+| create returns 200 but the alias is absent from `adapter_connection_list` | the alias got a package prefix, so the node lives elsewhere | recreate with `folder:name` and delete the wrong node |
+| `Invalid JSON: expected value at line 1 column 1` | `connection_settings` was not a JSON **string** | pass a serialized JSON object, not `key=value` text |
+
+## Next step
+
+Once `connectionState` is `enabled`, build adapter services on top of it:
+see `wm://docs/adapter-service-reference`.
+"#;
+
 const ADAPTER_SERVICE_REF: &str = r#"# Adapter Service Configuration Reference
 
 ## Creating JDBC Adapter Services
@@ -1417,8 +1662,13 @@ const ADAPTER_SERVICE_REF: &str = r#"# Adapter Service Configuration Reference
    - `schemaNames` (values: [catalog]) -> pick schema
    - `tableNames` (values: [catalog, schema]) -> pick table
    - `columnInfo` (values: [catalog, schema, table]) -> get columns
-2. Build `adapter_service_settings` JSON from the column metadata
-3. Call `adapter_service_create` with the settings
+2. CustomSQL statement -> `jdbc_custom_sql_create`; batch load of a table ->
+   `jdbc_batch_insert_create`. Both build the template properties, create the
+   node and verify it exists.
+3. Other templates (Select, Insert, Update, Delete, StoredProcedure): build
+   `adapter_service_settings` from the column metadata as shown below and
+   call `adapter_service_create` (which also verifies the node exists).
+4. `service_invoke` with a test input; the output record is `<svc>Output`.
 
 ### Select Service Settings
 ```json
@@ -1459,6 +1709,187 @@ const ADAPTER_SERVICE_REF: &str = r#"# Adapter Service Configuration Reference
 }
 ```
 Note: Exclude identity/auto-increment columns from Insert update.* arrays.
+
+### Select: properties that are easy to miss (verified on IS 12.1, JDBC Adapter 10.3, PostgreSQL)
+- `select.sortOrder` is REQUIRED: one entry per `select.expression`, `""` for
+  no ORDER BY (`"Ascend"` / `"Descend"` otherwise). A Select created without it
+  fails on EVERY invocation with `[ART.114.505] ... Cannot load from object
+  array because "this.sortOrder" is null` -- the node looks fine in Designer
+  and in adapter_service_get, only the runtime breaks.
+- int / boolean properties (`select.maxRow`, `select.queryTimeOut`,
+  `select.autoDelete`) travel as JSON STRINGS (`"0"`, `"-1"`, `"false"`): a
+  JSON number becomes a java.lang.Long and the metadata layer rejects it with
+  `[ART.114.238] Value for parameter select.maxRow does not match data type int`.
+- `tables.columnInfo` and `tables.realSchemaName` only feed Designer's
+  resource-domain lookups; the runtime does not need them.
+- Output shape: `<out>/results` is a RECORD LIST (`results;2;1`) even for a
+  single row. A flow must read `results[0]` --
+  `/selectPetOutput;2;0/results[0];2;1/name;1;0` -- and test the empty case
+  (`pub.list:sizeOfList` on `results`, BRANCH on `size` = `0`). Reading
+  `results;2;0` as a single record silently yields nulls.
+
+### Select with a WHERE clause (input parameters)
+`WHERE T1.id = ?` bound to an input field `id` of the `<in>` record
+(`selectPetInput/id`), verified end to end:
+```json
+{
+  "...": "the select.* / tables.* settings above, plus",
+  "where.andOr": [""],
+  "where.leftParen": [""],
+  "where.leftExpr": ["T1.id"],
+  "where.operator": ["="],
+  "where.rightExpr": ["?"],
+  "where.rightParen": [""],
+  "where.hiddenJDBCType": ["BIGINT"],
+  "where.hiddenInputType": ["java.lang.String"],
+  "where.hiddenInputField": ["id"],
+  "where.parameter": ["T1.id"],
+  "where.inputFieldName": ["T1.id"],
+  "where.hiddenInputFieldName": ["id"],
+  "where.JDBCType": ["BIGINT"],
+  "where.inputType": ["java.lang.String"],
+  "where.inputField": ["id"]
+}
+```
+- One row per condition across `where.andOr` / `leftParen` / `leftExpr` /
+  `operator` / `rightExpr` / `rightParen`; they are concatenated in that order
+  to build the SQL text (empty strings are skipped). First `andOr` is `""`,
+  the next rows use `AND`, `OR`, `AND NOT`, `OR NOT`. Operators: `=`, `<>`,
+  `<`, `>`, `<=`, `>=`, `LIKE`, `IS`, `IS NOT`. `rightExpr` is `?` for a bound
+  parameter, or a literal SQL expression.
+- Each `?` consumes, in order, one entry of `where.inputField` (name of the
+  field in the input record), `where.inputType` (Java type) and
+  `where.JDBCType`; that triple is what binds the prepared statement and
+  what generates the input signature. The `hidden*`, `parameter` and
+  `inputFieldName` arrays are Designer bookkeeping: keep them consistent
+  (`parameter` and `inputFieldName` = the column expression,
+  `hiddenInputFieldName` / `hiddenInputField` = the column name).
+- Valid values come from adapter_resource_domain_lookup on the Select
+  template: `andOr`, `operator`, `leftParen`, `rightParen`,
+  `defaultExpression` (`?`), `sortModes`, `columnInfo(catalog, schema, table)`.
+
+### Silent refusals: what `adapter_service_create` now checks for you
+`wm.art.dev.service:createAdapterServiceNode` answers HTTP 200 even when the
+Adapter Runtime refuses the node; the refusal is only in server.log:
+`[ART.117.4030] Unable to create adapter service X. [ART.114.72] Unable to set
+JavaBean properties. [ART.114.542] could not set property "realInputFields"
+... argument type mismatch`. The tool verifies the node exists afterwards and
+returns those log lines as an error when it does not. Rules:
+- **Never send an empty JSON array** (`"inputField": []` for a parameterless
+  statement): it arrives as `Object[]`, the setter wants `String[]`. The
+  tool strips empty arrays and reports them in `omitted_empty_arrays`.
+- int / boolean properties are JSON STRINGS (`"0"`, `"-1"`, `"false"`).
+- Every `*.` array of one group must have the same length.
+
+### CustomSQL (`com.wm.adapter.wmjdbc.services.CustomSQL`) -- use `jdbc_custom_sql_create`
+`jdbc_custom_sql_create(service_name, package_name, connection_alias, sql,
+inputs?, outputs?, result_row_field?)` builds everything below, creates the
+node and verifies it. Verified settings (IS 12.1, JDBC Adapter 10.3,
+PostgreSQL), two bind parameters, two result columns:
+```json
+{"sql":"SELECT o.order_line_id, o.order_id FROM staging.orders o WHERE o.order_line_id > ? AND o.order_line_id <= ?",
+ "sqlFieldType":"java.lang.String",
+ "colInfo":"0;from_id;BIGINT;IN;\n1;to_id;BIGINT;IN;\n0;order_line_id;BIGINT;OUT;\n1;order_id;VARCHAR;OUT;\n",
+ "inputColIndexes":["0","1"], "inputExpression":["from_id","to_id"], "inputJDBCType":["BIGINT","BIGINT"],
+ "inputFieldType":["java.lang.String","java.lang.String"], "inputField":["from_id","to_id"], "realInputFields":["from_id","to_id"],
+ "outputColIndexes":["0","1"], "outputExpression":["order_line_id","order_id"], "outputJDBCType":["BIGINT","VARCHAR"],
+ "outputFieldType":["java.lang.String","java.lang.String"], "outputField":["order_line_id","order_id"],
+ "resultField":["results[].order_line_id","results[].order_id"], "resultFieldType":["java.lang.String[]","java.lang.String[]"],
+ "realOutputField":["results[].order_line_id","results[].order_id"],
+ "maxRow":"0", "queryTimeOut":"-1", "resultRowField":"", "resultRowFieldType":"", "designTimeLocale":"en",
+ "userid":"overrideCredentials.$dbUser","useridType":"java.lang.String","inputUseridSign":"overrideCredentials.$dbUser",
+ "password":"overrideCredentials.$dbPassword","passwordType":"java.lang.String","inputPasswordSign":"overrideCredentials.$dbPassword"}
+```
+- `colInfo` format: one line per column, `index;name;JDBCTYPE;IN|OUT;`, IN and
+  OUT indexed separately from 0. The `customSQLcolInfo` lookup (`values:
+  [sql]`) returns it for simple statements and **`-1`** as soon as the SQL
+  has a join with aliases, a subquery, a function call, `||`, a
+  schema-qualified name the parser dislikes (`public.tag`) or a reserved
+  word used as an identifier -- the adapter's parser (fdb-sql-parser) gives
+  up; write the column list yourself (or pass `outputs` to
+  `jdbc_custom_sql_create`; an INSERT/UPDATE/DELETE with typed inputs is
+  accepted without it). The runtime does not need the parser: any vendor
+  SQL executes.
+- `java.lang.String` works for every type in both directions: DATE,
+  TIMESTAMP (`yyyy-MM-dd HH:mm:ss.SSS`), NUMERIC, BOOLEAN (`true`/`false`).
+- `resultRowField` names an extra output field holding the affected-row count
+  (INSERT/UPDATE/DELETE); `resultRowFieldType` is then `java.lang.String`.
+- Output shape: `<svc>Output/results[]` -- a document list, empty when no
+  row. Input shape: `<svc>Input/<inputField>`.
+
+### BatchInsert (`com.wm.adapter.wmjdbc.services.BatchInsert`) -- use `jdbc_batch_insert_create`
+`jdbc_batch_insert_create(service_name, package_name, connection_alias,
+catalog?, schema, table, exclude_columns?)` reads the columns with the
+`columnInfo` lookup and builds these settings:
+```json
+{"tables.tableIndexes":["T1"],"tables.catalogName":["winfarm"],"tables.schemaName":["dwh"],"tables.tableName":["dim_customer"],
+ "tables.tableType":["TABLE"],"tables.columnInfo":["<columnInfo string from the lookup>"],"tables.realSchemaName":["dwh"],
+ "update.column":["customer_code","customer_name"],"update.columnType":["CHARACTER(10) VARYING NOT NULL","CHARACTER(80) VARYING"],
+ "update.JDBCType":["VARCHAR","VARCHAR"],"update.expression":["?","?"],
+ "update.inputColumn":["customer_code","customer_name"],"update.inputColumnType":["...","..."],"update.inputJDBCType":["VARCHAR","VARCHAR"],
+ "update.inputField":["customer_code","customer_name"],"update.inputFieldType":["java.lang.String","java.lang.String"],
+ "update.batchInputField":["inputs[].customer_code","inputs[].customer_name"],"update.batchInputFieldType":["java.lang.String[]","java.lang.String[]"],
+ "update.realInputField":["inputs[].customer_code","inputs[].customer_name"],"update.queryTimeOut":"-1",
+ "updatecount.fieldName":"updateCount","updatecount.updateCountOutputName":["updateCount[]"],
+ "updatecount.updateCountOutputType":["java.lang.String[]"],"updatecount.realOutput":["updateCount[]"],
+ "designTimeLocale":"en", "userid":"overrideCredentials.$dbUser", "...": "same credential properties as CustomSQL"}
+```
+- Signature: `<svc>Input/inputs[]` (document LIST, one document per row,
+  String fields named after the columns) -> `<svc>Output/updateCount[]`.
+- Generated SQL: `INSERT INTO <catalog>.<schema>.<table>(cols) VALUES (?,...)`
+  (three-part name: fine on PostgreSQL when catalog = current database).
+  `catalog` may be the adapter's own `<current catalog>` entry (first value
+  of the `catalogNames` lookup, Designer's default): the INSERT then runs in
+  the connection's database without a catalog qualifier -- verified.
+  `jdbc_batch_insert_create` uses it when `catalog` is omitted.
+- Exclude serial/identity and defaulted columns (`exclude_columns`).
+- The connection must be `LOCAL_TRANSACTION`: on a `NO_TRANSACTION`
+  connection even the lookups fail with `[ADA.1.213] Batch services can only
+  be configured on transaction type "LOCAL_TRANSACTION"`.
+- If `inputs` is missing from the pipeline the service runs `executeUpdate`
+  with no parameters and the driver answers `(07009/0) Invalid parameter
+  binding(s)` -- the cause is the missing list, not the types.
+- Throughput reference: 20 000 rows per call, ~8 700 rows/s end to end with
+  `otherProperties: "BatchPerformanceWorkaround=true"` on the DataDirect
+  PostgreSQL connection.
+- Same `update.*` layout without the `batchInputField*` / `realInputField`
+  `inputs[].` prefixes gives a single-row Insert.
+
+### Resource-domain lookups with array-valued dependencies
+`adapter_resource_domain_lookup` takes `values` as one entry per dependency.
+Some domains depend on an ARRAY (declared `*tables.columnInfo` in the
+template): `updateColumnNames`, `updateColumnTypes`, `updateJDBCTypes`. The
+ART transports such an array as ONE string, elements escaped (`\` -> `\\`,
+newline -> the two characters `\n`) and joined by real newlines
+(`com.wm.adk.metadata.AdapterValues`). Passing the raw `columnInfo` string
+(which contains newlines) splits it into its lines and fails with
+`[ART.114.243] ... Cannot read field "value" because "original" is null`.
+Pass a nested JSON array instead and the tool encodes it:
+`values: [["<columnInfo string>"]]` -> the three domains come back together
+(`updateJDBCTypes` gives the adapter's own JDBC type names per column).
+
+`columnInfo` itself is that encoding applied twice: an array of columns,
+each column an array `[name, sqlType, java.sql.Types code, position,
+identifierQuote]` -- so column fields are separated by the literal two
+characters `\n` and columns by real newlines. Codes: 4 INTEGER, 5 SMALLINT,
+-5 BIGINT, 2 NUMERIC, 12 VARCHAR, 91 DATE, 93 TIMESTAMP, 16 BOOLEAN.
+
+### Transactions (verified)
+A `LOCAL_TRANSACTION` connection with explicit
+`pub.art.transaction:startTransaction` / `commitTransaction` /
+`rollbackTransaction` in each sub-flow works (any transaction name; TRUNCATE
+inside the transaction is fine). Use a second `NO_TRANSACTION` connection for
+a run log so its rows are visible while the load runs. In the CATCH block,
+BRANCH on the transaction name (`$null` -> nothing to roll back, `$default`
+-> rollback) before re-throwing with `EXIT $flow FAILURE`.
+
+### Updating an existing adapter service
+`adapter_service_update` locks the node (`wm.server.ns:lockNode`), calls
+`wm.art.dev.service:updateAdapterServiceNode` and unlocks it; without the
+lock the IS answers `[ART.117.4050] ... needs to be checked out or lock for
+edit`. Send the complete settings (adapter_service_get, edit, send back).
+Verify with service_invoke: `{"selectPetInput": {"id": "1"}}` must return
+`selectPetOutput.results` (possibly empty), not an ART error.
 "#;
 
 const FLOW_STEPS_REF: &str = r#"# webMethods Flow Steps Reference
@@ -1682,6 +2113,10 @@ the EXIT always causes exit regardless of the Exit on setting.
 ---
 
 ## REPEAT
+
+putNode representation: `"type": "RETRY"` with `count`, `backoff` (repeat
+interval, seconds) and `repeat-on` (`SUCCESS` | `FAILURE`) -- see the Flow
+Language Reference. "REPEAT" is only the Designer display name.
 
 The REPEAT step executes child steps repeatedly, up to a specified count.
 Behavior depends on the repeat condition:
@@ -2024,7 +2459,7 @@ Binary numeric promotion: Double > Float > Long > Integer.
 ## pub.list (List Folder)
 
 ### pub.list:appendToDocumentList
-Appends documents to a document list. Appends references, not copies.
+Appends documents to a document list. Appends REFERENCES, not copies: MAPDELETE `fromItem` after each call, or the next iteration's writes into the same variable overwrite the entry already in the list (verified IS 12.1).
 - **In:** `toList` (Document List, opt - creates new if absent), `fromList` (Document List, opt), `fromItem` (Document, opt; added after fromList items)
 - **Out:** `toList` (Document List)
 
@@ -2102,6 +2537,8 @@ Compares two dates.
 Calculates difference between two dates. Each output is the SAME difference in different units (do NOT add them).
 - **In:** `startDate` (String, req), `endDate` (String, req), `startDatePattern` (String, req), `endDatePattern` (String, req)
 - **Out:** `dateDifferenceSeconds` (String), `dateDifferenceMinutes` (String), `dateDifferenceHours` (String), `dateDifferenceDays` (String) - all truncated to whole numbers
+- The difference is ABSOLUTE (no sign): to know which instant is later, compare the two
+  values formatted as `yyyyMMddHHmmss` strings instead (verified IS 12.1).
 
 ### pub.date:currentNanoTime
 Returns current time in nanoseconds (high-precision timer).
@@ -2269,6 +2706,33 @@ Rolls back a managed adapter transaction.
 
 ---
 
+## Verified call patterns (IS 12.1)
+
+- `pub.scheduler:addOneTimeTask`: `date` as `yyyy/MM/dd`, `time` as `HH:mm:ss`;
+  a time in the past is refused with `[ISS.0085.9114]` -- compute the value
+  with `pub.date:incrementDate` (addSeconds=3) first.
+- Durations: `pub.date:currentNanoTime` and `elapsedNanoTime` return
+  `java.lang.Long` objects -- convert with `pub.string:objectToString` (output
+  field `string`) before `pub.math:divideFloats` (precision `0`) /
+  `roundNumber`.
+- `pub.flow:getLastError` in a CATCH: `lastError` is a
+  `pub.event:exceptionInfo` document -- map
+  `/lastError;4;0;pub.event:exceptionInfo/error;1;0` to a String, then
+  `EXIT from="$flow" signal="FAILURE" failure-message="step : %errorMsg%"`
+  (`%var%` substitution works in failure-message).
+- `pub.jwt:generateSignedJWT`: `expirationTime` accepts ONLY the format `dd/MM/yyyy HH:mm:ss`
+  (anything else fails with `[ISS.0163.9015]`); build it with `pub.date:getCurrentDateString` /
+  `incrementDate` using that pattern.
+- `pub.document:documentListToDocument`: `name` and `value` are REQUIRED -- they are the names
+  of the key and value fields inside each list entry (e.g. `name`="key", `value`="val").
+- `pub.security.outboundPasswords:setPassword` takes a `WmSecureString` for `password`
+  (build it with `pub.security.util:createSecureString` / `convertSecureString`); a plain
+  String is rejected. `getPassword` for an unknown key answers `password = null` with NO
+  error -- BRANCH on `$null` before using it.
+- Invoking a service from a UI: `POST /invoke/<folder>/<svc>` with
+  `Content-Type` and `Accept: application/json` + Basic auth; files under
+  the package's `pub/` directory are served with the same authentication.
+
 ## pub.json (JSON Processing)
 
 ### pub.json:documentToJSON
@@ -2279,8 +2743,10 @@ Converts an IData document to a JSON string.
 
 ### pub.json:jsonStringToDocument
 Parses a JSON string into an IData document.
-- **In:** `jsonString` (String, req)
+- **In:** `jsonString` (String, req), `decodeIntegerAsLong` (String, default true), `decodeRealAsDouble` (String, default true)
 - **Out:** `document` (Document - the parsed IData)
+- JSON numbers arrive as `java.lang.Long` / `Double` OBJECTS, not Strings: convert with
+  `pub.string:objectToString` (output `string`) before `pub.math:*` or a String mapping.
 
 ---
 
@@ -2294,8 +2760,15 @@ Invokes a SOAP web service endpoint.
 
 ### pub.client:http
 Sends an HTTP request (GET, POST, PUT, DELETE, etc.).
-- **In:** `url` (String, req), `method` (String - GET/POST/PUT/DELETE), `data` (Object/String/InputStream), `headers` (Document), `auth` (Document - `type`, `user`, `pass`), `encodingType` (String)
-- **Out:** `header` (Document), `body` (Object), `statusCode` (String), `statusMessage` (String)
+- **In:** `url` (String, req), `method` (String - GET/POST/PUT/DELETE), `data` (Document: `string` | `bytes` | `stream` | `args` | `table`), `headers` (Document), `auth` (Document - `type`, `user`, `pass`), `encodingType` (String), `loadAs` (String: `bytes` | `stream` -- there is NO `string` option), `throwExceptionOnHttp401` (String, default true)
+- **Out:** `header` (Document: `lines` (Document of response headers), `status` (String, the HTTP code), `statusMessage`), `body` (Document: `bytes` or `stream`), `encoding`
+- Verified IS 12.1: the HTTP code is `header/status`, NOT a root-level `statusCode`; convert
+  `body/bytes` with `pub.string:bytesToString`; set `throwExceptionOnHttp401` to `false` to
+  handle a 401 yourself (token refresh) instead of catching an exception.
+- IS 12.1 intercepts any INCOMING `Authorization: Bearer` header on `/invoke` and answers
+  `[ISS.0010.8044] token invalid or expired` before the service runs: a flow service cannot
+  host an endpoint protected by its own bearer-token check (use Basic auth, an ACL, or host
+  the simulator outside the IS).
 
 ### pub.client.ftp:login
 Opens FTP connection.
@@ -2354,10 +2827,38 @@ const FSL_LANGUAGE_REF: &str = r#"# FSL (Flow Service Language) Reference
 
 FSL is a text-based DSL for authoring flow services, used with the
 `dsl_validate` / `fsl_deploy` / `fsl_extract` tools as an alternative to
-building a service field-by-field via `put_node`. Prefer FSL for anything
-beyond a trivial one-step service -- it is far less error-prone than hand
-building a putNode tree, and `dsl_validate` lets you catch syntax errors
-before touching the server.
+building a service field-by-field via `put_node`. `dsl_validate` catches
+syntax errors before touching the server, which makes FSL pleasant for
+services made of scalar mappings, INVOKEs, BRANCH/IF and TRY/CATCH.
+
+## When NOT to use FSL (IS 12.1 compiler limitations, verified)
+
+The compiler (`wm.server.flowGen`, IBM code on the IS side) accepts and
+"deploys" constructs it does not actually emit. `dsl_validate` says SUCCESS,
+`fsl_deploy` says SUCCESS, and the flow is missing steps:
+
+- **Document-list copies are dropped** when the list variable is not declared
+  in the service `input {}`: `copy selectOutput/results -> reps;` followed by
+  `copy reps -> insertInput/inputs;` compiles to an EMPTY input MAP (the
+  variable is typed `;2;0`, a single record). It only works when the list is
+  part of the service signature.
+- **`WHILE (...) { ... }` compiles to nothing** -- no LOOP/RETRY is emitted,
+  the body is lost.
+- **`date` is a reserved word**: `INVOKE pub.date:getCurrentDateString` is a
+  parse error (`mismatched input 'date'`), and the documented backtick escape
+  ``pub.`date`:getCurrentDateString`` is compiled with the backticks kept,
+  so the service fails at run time with `[ISC.0049.9010] unknown service`.
+  The same applies to a field named `date` (`pub.scheduler:addOneTimeTask`).
+  `fsl_extract` emits `pub.date:` unescaped, so its output is not
+  re-validatable (no round trip). Expect the same class of problem with other
+  keywords used as names (`time`, `type`, `value`, `pattern`).
+
+Use `put_node` for anything with document lists, loops over records, RETRY,
+or `pub.date` / `pub.scheduler` calls -- its JSON is verbose but every step
+lands, the tree is validated before writing, and the stored step counts are
+verified afterwards. After any `fsl_deploy`, read the service back with
+`node_get` (it returns the real step tree) and check that every `copy`,
+LOOP and RETRY you wrote is present before invoking it.
 
 ## Workflow
 
@@ -2369,11 +2870,12 @@ before touching the server.
    `errorCount`. Iterate until clean; this is a pure syntax check, no server
    mutation.
 4. `fsl_deploy` it with `package_name`, `ifc_name` (folder path), and
-   `flow_name`. This compiles AND deploys in one atomic call -- there is no
-   separate "create shell then fill it" step like `put_node` requires. The
-   compiled node returned in the response is informational only; do not
-   repost it via `put_node`.
-5. Verify with `node_get` and a `service_invoke` test call. `fsl_extract` can
+   `flow_name`. This compiles AND deploys in one atomic call. The compiled
+   node returned in the response is informational only; do not repost it via
+   `put_node` (its `flow.nodes` is flattened to a string).
+5. Verify with `node_get` (count the MAPCOPY / LOOP / RETRY steps in
+   `flow.nodes` against your source -- see the limitations above) and a
+   `service_invoke` test call. `fsl_extract` can
    decompile an existing service back to FSL (useful to see the canonical
    form of something built via `put_node`, or to diff after a redeploy) --
    the round-tripped FSL is semantically equivalent but not always textually
@@ -2577,4 +3079,218 @@ throws "Missing Parameter" at runtime. E.g. `pub.math:addInts` takes String
 variable must still be declared `String` in `mapTarget`. Only fall back to
 matching the source variable's own type when the target service imposes no
 type constraint.
+"#;
+
+const UNIT_TEST_REF: &str = r#"# Unit Test Framework Reference (authoring, running, reading results)
+
+## What it is
+
+The official IS unit-testing stack, formerly *WmTestSuite*, is the **Unit Test
+Framework** (IBM still calls the server part "Integration Test Suite"):
+
+| Piece | Role | Reachable from this server? |
+|---|---|---|
+| Designer plugin `com.sag.gcs.wmtestsuite` | GUI to author suites, "Generate Tests" from a service run, run/debug them | No (Eclipse UI, no API). `test_suite_create` writes the same files. |
+| IS system package `WmUnitTestManager` (IS 11.1+) | service mocks (`wm.ps.serviceMock`), runner (`wm.task.executor`), suite discovery (`wm.task.asset`), REST API `/admin/utf/...`, web UI `/WmUnitTestManager/` | Yes: `test_run`, `test_check_status`, `test_report`, `test_text_report`, `test_junit_report`, `test_suite_list`, `test_suite_get`, `mock_*` |
+| Test Suite Executor (Ant project generated by Designer) | headless runs in CI, JUnit XML + HTML + coverage | No; `test_run` produces the same JUnit XML server-side |
+
+A suite is an XML file (`<webMethodsTestSuite>`) inside the package under test;
+each `<webMethodsTestCase>` invokes one service with an input pipeline file and
+checks the output pipeline (file, field assertions, or expected exception),
+optionally with mocks. Pipeline files use the IDataXMLCoder format
+(`pub.flow:savePipelineToFile`). Any `*.xml` under the package directory that
+validates as a suite is discovered; Designer's convention is
+`resources/test/setup/<suite>.xml` with data files in `resources/test/data/`.
+
+## Prerequisites (check before anything else)
+
+- `WmUnitTestManager` enabled (`package_info`). On IS 11.1/12.1 it ships with
+  the server.
+- The Unit Test Framework client JARs in `<IS_HOME>/common/lib/testsuite/`
+  (junit, serviceMockClient, serviceInterceptor, wmjxpath, xmlunit, httpunit,
+  hamcrest, commons-jxpath, xml-soap-api). They are installed with Designer,
+  NOT by the IS installer: on a Linux-only IS `test_run` fails with
+  `common/lib/testsuite does not exist`, and field assertions error with
+  `NoClassDefFoundError com.wm.ps.jxpath.IDataJXPathContext` until the 9 JARs
+  are copied from a Designer installation.
+- To write suites, the MCP server must reach the IS packages directory on
+  disk, or the IS must allow `pub.file:stringToFile` there (extended setting
+  `watt.server.file.canWritePaths`; the error `[ISS.0086.9263]` names it).
+
+## Workflow
+
+1. Build the service (`put_node` / `fsl_deploy`) and check it with
+   `service_invoke`.
+2. `test_suite_create` -- package, suite_name, `tests` (JSON array, below).
+3. `test_suite_list` -- confirm the suite and its cases were discovered.
+4. `test_run` with `test_suite_packages` = `["<Package>"]`. The call blocks
+   until the run completes (`waitForReport` defaults to true on the IS) and
+   returns `executionID`, `status` and the counts (`testCount`,
+   `failureCount`, `errorCount`).
+5. `test_report` (readable verdict + one table per suite with each case's
+   result and failure message; `format: "json"` for the structured summary),
+   `test_text_report` (raw text with stack traces) or `test_junit_report`
+   (JUnit XML for CI). All need status COMPLETED.
+
+## `tests` JSON specification
+
+```json
+[
+  {"name": "greetAlice", "description": "full pipeline compare",
+   "service": "utfdemo.services:greet",
+   "input": {"name": "Alice"},
+   "expected": {"greeting": "Hello, Alice"}},
+
+  {"name": "defaultName", "service": "utfdemo.services:greet",
+   "expected_fields": [{"path": "/greeting", "operator": "==", "value": "Hello, World"}]},
+
+  {"name": "rejectsNegative", "service": "orders.api:validate",
+   "input": {"amount": "-1"},
+   "expected_exception": {"message": "Amount must be greater than or equal to zero"}},
+
+  {"name": "snapshot", "service": "utfdemo.services:greet",
+   "input": {"name": "Bob"}, "record": true},
+
+  {"name": "isolatedFromHttp", "service": "orders.api:fetch",
+   "input": {"id": "42"},
+   "expected_fields": [{"path": "/status", "value": "OK"}, {"path": "/order/total", "operator": ">", "value": 0, "logical": "and"}],
+   "mocks": [
+     {"service": "pub.client:http", "pipeline": {"status": "200", "body": {"string": "{\"total\":10}"}}},
+     {"service": "orders.db:insert", "alternate_service": "orders.mocks:insertOk", "parms": {"trace": "true"}},
+     {"service": "pub.client:smtp", "exception": {"class": "java.io.IOException", "message": "mail down"}, "scope": "server", "lifetime": "suite"}
+   ]}
+]
+```
+
+Per test case:
+
+- `service` -- `folder.sub:name` of the service under test.
+- `input` -- JSON object written as `<test>_input.xml`. Omit for no input.
+- `expected` -- JSON object written as `<test>_expected.xml`. **Subset
+  match**: every expected variable must exist in the actual output with an
+  equal value; extra actual variables are ignored (so listing only the
+  declared outputs is enough).
+- `expected_fields` -- assertions on the actual output: `path` is a JXPath
+  (`/greeting`, `/order/lines[1]/qty`), `operator` one of `==` (default)
+  `!=` `>` `>=` `<` `<=`, `value` a string/number/boolean literal (omit it to
+  compare with the same path of the `expected` pipeline), `logical` joins with
+  the previous field (`and` default, `or`, `and not`, `or not`),
+  `start_paren`/`end_paren` for grouping. **When fields are present the
+  validator evaluates only the fields**: the `expected` pipeline is then just
+  the reference for fields given without `value`, not a second comparison.
+  To check several variables at once, put them all in `expected` (subset
+  match) or list them all as fields.
+- `expected_exception` -- `{class, message}`; the test passes when the
+  service throws an exception whose text contains the class name and the
+  message (substring or regex). `class` defaults to
+  `com.wm.app.b2b.client.ServiceException`, which is what a failing flow
+  service raises in the JUnit runner. Cannot be combined with `expected` /
+  `expected_fields`.
+- `record: true` -- Designer's "Generate Tests": the service is invoked now
+  with `input`; its declared outputs (per the service signature) become
+  `expected`, or, if it fails, the failure becomes `expected_exception`.
+  The result JSON lists what was recorded -- check it. The recording runs
+  without mocks, so `record` is refused on a test that declares `mocks`.
+- `mocks` -- each replaces `service` for the duration of the test (or the rest
+  of the suite with `lifetime: "suite"`) with exactly one of: `pipeline`
+  (fixed output), `alternate_service` (invoked with the same pipeline, plus
+  `parms` merged in), `exception`. `scope` defaults to `session`, which is the
+  right value inside a suite (the runner keeps one session for the whole run).
+- `description`, `enabled` (false = skipped), `mocks_enabled` (false =
+  ignore this test's mocks), `comparator_service` (a service implementing the
+  spec `wm.spec:result_comparator`: inputs `actualData`, `expectedData`,
+  outputs `result` boolean + `exceptionMessage`), `request_method`
+  (`invoke` default; `post`/`get` test an HTTP endpoint with httpunit, then
+  `input` is the request body and `expected` a file compared byte for byte).
+
+Pipelines are plain JSON objects. Strings stay Strings, objects become
+documents, arrays of strings/objects become String[] / IData[], numbers and
+booleans keep Java types (`java.lang.Long`, `java.lang.Double`,
+`java.lang.Boolean`) exactly as `service_invoke` sends them -- so give flow
+String fields JSON strings (`"5"`, not `5`): a MAPCOPY into a String field
+silently drops a Long, and the test then sees `null`. `test_suite_create`
+lists every such value under `warnings`; treat them as mistakes unless the
+field really is an Object.
+
+## What gets written (Designer-compatible)
+
+```
+<Package>/resources/test/setup/<suite_name>.xml
+<Package>/resources/test/data/<suite_name>/<test>_input.xml
+<Package>/resources/test/data/<suite_name>/<test>_expected.xml
+<Package>/resources/test/data/<suite_name>/<test>_mock<N>_<service>.xml        (mock pipeline)
+<Package>/resources/test/data/<suite_name>/<test>_mock<N>_<service>_parms.xml  (alternate-service parms)
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<webMethodsTestSuite name="GreetSuite" description="">
+    <webMethodsTestCase description="" name="greetAlice">
+        <mock folder="pub.string" name="concat">
+            <pipeline filename="resources/test/data/GreetSuite/greetAlice_mock1_pub.string_concat.xml"/>
+        </mock>
+        <service folder="utfdemo.services" name="greet">
+            <input>
+                <file filename="resources/test/data/GreetSuite/greetAlice_input.xml"/>
+            </input>
+            <expected>
+                <file filename="resources/test/data/GreetSuite/greetAlice_expected.xml"/>
+                <field path="/greeting" operator="==" value="Hello, Alice"/>
+            </expected>
+        </service>
+    </webMethodsTestCase>
+</webMethodsTestSuite>
+```
+
+Attributes equal to their defaults (`enabled="true"`, `mocksEnabled="true"`,
+`scope="session"`, `lifetime="test"`, `requestMethod="invoke"`) are omitted,
+as Designer's serializer does. File names are relative to the package
+directory. Designer opens these suites; `mode: "append"` also adds cases to a
+suite Designer created (even the empty `<webMethodsTestSuite/>`).
+
+A pipeline file:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+
+<IDataXMLCoder version="1.0">
+  <record javaclass="com.wm.data.ISMemDataImpl">
+    <value name="name">Alice</value>
+    <record name="order" javaclass="com.wm.data.ISMemDataImpl">
+      <value name="id">42</value>
+    </record>
+    <array name="tags" type="value" depth="1">
+      <value>a</value>
+      <value>b</value>
+    </array>
+  </record>
+</IDataXMLCoder>
+```
+
+## Service mocks outside suites (`mock_load`)
+
+`mock_load {service, mock_object (alternate service), scope}` intercepts a
+service for the whole IS. Scopes: `server` (default -- the only one that
+survives across MCP calls, because every call is a new IS session), `user`,
+`session` (useless through MCP). `mock_list` shows active mocks per scope,
+`mock_clear` needs the same scope as the load, `mock_clear_all` removes
+everything. Clean up: server-scoped mocks affect every caller of the IS.
+
+## Gotchas
+
+- A `test_run` on a package that has **no** suite (or an unknown package
+  name) silently runs every suite of the server and reports their counts under
+  the requested name -- confirm with `test_suite_list` first.
+- `test_run` blocks until the run ends; the MCP HTTP timeout is 30 s by
+  default. Keep suites small or raise the instance timeout.
+- `test_check_status` values: NEW, INVOKED, INPROGRESS, COMPLETED, ERROR,
+  UNAVAILABLE (unknown executionID). Reports exist only after COMPLETED; an
+  unknown or running executionID yields `Report ... unavailable, or not
+  generated`.
+- The JUnit XML from `test_junit_report` has its `<properties>` block (JVM
+  properties, ~100 KB) stripped unless `include_properties` is true.
+- Field paths are evaluated with JXPath on the actual output pipeline; a
+  missing variable makes the comparison fail, it does not raise.
+- `record: true` captures whatever the service returns today, including bugs:
+  read the recorded values in the response before trusting the test.
 "#;
